@@ -8,19 +8,19 @@ import sys
 import os
 import urllib.request
 import urllib.parse
+import http
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 # --- CONFIGURATION (SECURE CLOUD MODE) ---
-# These lines tell the script to look for variables in Render's Environment
-# If running locally, you can set defaults or rely on the script failing safely
-API_ID = int(os.environ.get('API_ID', 0))
-API_HASH = os.environ.get('API_HASH', '')
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '') 
-BOT_CHAT_ID = os.environ.get('BOT_CHAT_ID', '')
+# Use os.environ.get to safely read from Render Environment Variables
+API_ID = int(os.environ.get('API_ID', 18384173))
+API_HASH = os.environ.get('API_HASH', 'bb8b0e6fba49bd873f68ac98547ded2b')
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '8215053396:AAHhwbn74Bfzv-tvf7oVHNQwb3K54f-8qyo')
+BOT_CHAT_ID = os.environ.get('BOT_CHAT_ID', '943672693')
 SESSION_STRING = os.environ.get('SESSION_STRING', '') 
 
-# Render provides the PORT variable automatically. Default to 8765 for local testing.
+# Render assigns a PORT. Default to 8765 for local testing.
 PORT = int(os.environ.get("PORT", 8765))
 DB_FILE = 'signals.json'
 
@@ -61,7 +61,6 @@ BLACKLIST_PAIRS = {
 # --- DATABASE FUNCTIONS ---
 def load_history():
     global signal_history
-    # Note: On Render Free Tier, this file resets on restart.
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, 'r', encoding='utf-8') as f:
@@ -203,6 +202,12 @@ async def websocket_handler(websocket):
         connected_clients.remove(websocket)
         logger.info("❌ Dashboard Disconnected")
 
+# --- HEALTH CHECK HANDLER (Fixes 400 Bad Request on Cloud) ---
+async def health_check(path, request_headers):
+    if path == "/health":
+        return http.HTTPStatus.OK, [], b"OK"
+    return None
+
 async def main():
     load_history()
     global client 
@@ -229,10 +234,7 @@ async def main():
     @client.on(events.NewMessage)
     async def handler(event):
         sender = await event.get_chat()
-        
-        # LOOP FIX: Ignore messages from the Alert Bot
-        if sender and sender.id == BOT_ID:
-            return
+        if sender and sender.id == BOT_ID: return # Ignore bot messages
 
         is_watched = event.chat_id in valid_channels or event.is_private
         if not is_watched: return
@@ -247,7 +249,9 @@ async def main():
 
     # Binds to 0.0.0.0 for Cloud Access using Render's PORT
     logger.info(f"🚀 WebSocket Server running on 0.0.0.0:{PORT}")
-    async with websockets.serve(websocket_handler, "0.0.0.0", PORT, ping_interval=None, ping_timeout=None):
+    
+    # NOTE: process_request is crucial for cloud load balancers
+    async with websockets.serve(websocket_handler, "0.0.0.0", PORT, process_request=health_check, ping_interval=None, ping_timeout=None):
         print("🤖 Scraper Running...")
         await client.run_until_disconnected()
 
