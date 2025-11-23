@@ -1,2 +1,6 @@
-telethon==1.34.0
-websockets==12.0
+telethon
+websockets
+pymongo
+dnspython
+certifi
+asyncio
