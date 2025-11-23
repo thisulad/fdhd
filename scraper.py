@@ -86,29 +86,17 @@ def is_deleted(signal_id):
     return deleted_collection.find_one({'id': signal_id}) is not None
 
 def save_signal_to_db(signal_data):
-    """
-    Upsert signal. 
-    Returns: True if this is a NEW signal, False if it was just an update.
-    """
     if not signal_data or 'id' not in signal_data: return False
-    
-    # Check if deleted before (Backfill protection)
     if is_deleted(signal_data['id']): return False
 
     try:
-        # Check existence first
         existing = signals_collection.find_one({'id': signal_data['id']})
-        
-        # Save/Update
         signals_collection.update_one(
             {'id': signal_data['id']}, 
             {'$set': signal_data}, 
             upsert=True
         )
-        
-        # If no existing record, it's NEW
         return existing is None
-        
     except PyMongoError as e:
         logger.error(f"⚠️ DB Save Error: {e}")
         return False
@@ -123,9 +111,7 @@ def get_recent_history(limit=50):
 
 def delete_signal(signal_id):
     try:
-        # Remove from active signals
         signals_collection.delete_one({'id': str(signal_id)})
-        # Add to deleted list (Backfill ban)
         deleted_collection.update_one(
             {'id': str(signal_id)}, 
             {'$set': {'id': str(signal_id), 'deleted_at': time.time()}}, 
@@ -140,16 +126,13 @@ def parse_signal(text, timestamp=None, custom_id=None):
     if not text: return None
     clean_text = text.replace('**', '').replace('__', '').replace('`', '').strip()
     
-    # 1. Find Potential Pair
     pair_match = re.search(PATTERNS['pair_strict'], clean_text, re.IGNORECASE)
     if not pair_match: return None 
     
     raw_pair = pair_match.group(1).upper().replace('/', '')
     
-    # 2. Blacklist Check
     if raw_pair in BLACKLIST_PAIRS or len(raw_pair) < 3: return None
     
-    # 3. Context Check (The "Random Word" Killer)
     is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
     has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
     
@@ -189,7 +172,6 @@ def parse_signal(text, timestamp=None, custom_id=None):
 
     return signal
 
-# --- HELPER: ID NORMALIZER ---
 def get_clean_id(id_value):
     return abs(int(id_value)) if id_value is not None else 0
 
@@ -213,7 +195,6 @@ async def perform_backfill(client, valid_channels):
                 if parsed:
                     parsed['type'] = 'VIP' if (channel_id in vip_clean_ids) else 'Public'
                     parsed['source'] = 'Backfill'
-                    # Just save, don't alert
                     save_signal_to_db(parsed)
                     count += 1
         except Exception as e:
@@ -221,70 +202,10 @@ async def perform_backfill(client, valid_channels):
             
     logger.info(f"✅ Backfill Done. Synced {count} signals.")
 
-# --- WEBSOCKET & NOTIFICATION ---
+# --- WEBSOCKET ---
 async def broadcast_signal(signal_data, delete_action=False):
     if not connected_clients: return
     try:
         if delete_action:
             msg = json.dumps({"action": "delete", "id": signal_data})
-        else:
-            clean_data = {k:v for k,v in signal_data.items() if k != '_id'}
-            msg = json.dumps(clean_data)
-            
-        await asyncio.gather(*[client.send(msg) for client in connected_clients], return_exceptions=True)
-    except Exception as e:
-        logger.error(f"⚠️ Broadcast Error: {e}")
-
-def send_via_http(token, chat_id, message):
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-        encoded = urllib.parse.urlencode(data).encode('utf-8')
-        req = urllib.request.Request(url, data=encoded)
-        with urllib.request.urlopen(req) as response: pass
-    except Exception: pass
-
-async def send_telegram_alert(signal):
-    if not BOT_TOKEN or not BOT_CHAT_ID: return
-    emoji = "🟢" if signal.get('direction') == 'Long' else "🔴"
-    targets_str = "\n".join([f"   🎯 {t}" for t in signal['targets']])
-    
-    msg = (f"⚡ **{signal['pair']}** {emoji} **{signal['direction'].upper()}**\n\n"
-           f"📥 **Entry:** {signal['entry']}\n"
-           f"⚙️ **Lev:** {signal['leverage']}\n\n"
-           f"**Targets:**\n{targets_str}\n\n"
-           f"🔎 _Source: {signal.get('source', 'Unknown')}_")
-    
-    await asyncio.to_thread(send_via_http, BOT_TOKEN, BOT_CHAT_ID, msg)
-
-async def websocket_handler(websocket):
-    logger.info("✅ Dashboard Connected")
-    connected_clients.add(websocket)
-    
-    history = get_recent_history(50)
-    for old_signal in reversed(history):
-        await websocket.send(json.dumps(old_signal))
-        
-    try:
-        async for message in websocket:
-            try:
-                data = json.loads(message)
-                action = data.get('action')
-                if action == 'delete':
-                    delete_signal(data.get('id'))
-                    await broadcast_signal(data.get('id'), delete_action=True)
-                elif action == 'add':
-                    logger.info(f"➕ Manual Signal")
-                    payload = data.get('payload')
-                    if 'id' not in payload: payload['id'] = f"man_{int(time.time()*1000)}"
-                    payload['source'] = 'Manual'
-                    save_signal_to_db(payload)
-                    await broadcast_signal(payload)
-                    await send_telegram_alert(payload)
-            except json.JSONDecodeError: pass
-    except websockets.exceptions.ConnectionClosed: pass
-    except Exception as e: logger.error(f"WS Error: {e}")
-    finally:
-        connected_clients.remove(websocket)
-
-# --- HEALTH
+        else
