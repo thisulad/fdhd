@@ -242,16 +242,31 @@ async def websocket_handler(websocket):
         connected_clients.remove(websocket)
 
 async def health_check(connection, request):
+    # Allows Render AND Uptime bots to pass
     if request.path == "/health" or request.path == "/":
         return http.HTTPStatus.OK, [], b"OK"
     return None
 
-# --- MAIN (Refactored to Avoid SyntaxError) ---
+# --- MAIN ---
 async def main():
     global client
     
+    # --- 1. START SERVER FIRST (CRITICAL FIX FOR RENDER) ---
+    # We start the server immediately so Render detects an open port.
+    logger.info(f"🚀 Starting Server on port {PORT}...")
+    
+    server = await websockets.serve(
+        websocket_handler, 
+        "0.0.0.0", 
+        PORT, 
+        process_request=health_check, 
+        ping_interval=20, 
+        ping_timeout=20
+    )
+
+    # --- 2. AUTHENTICATE TELEGRAM ---
     if not SESSION_STRING:
-        logger.critical("❌ CRITICAL ERROR: SESSION_STRING missing.")
+        logger.critical("❌ FATAL: SESSION_STRING missing.")
         sys.exit(1)
 
     try:
@@ -266,6 +281,7 @@ async def main():
     valid_channels_set = set()
     all_chat_ids = CHANNELS['public'] + CHANNELS['vip']
     
+    # --- 3. RESOLVE CHANNELS ---
     for chat in all_chat_ids:
         try:
             entity = await client.get_entity(chat)
@@ -274,8 +290,7 @@ async def main():
             logger.info(f"   ✅ Verified: {getattr(entity, 'title', chat)} [ID: {clean_id}]")
         except Exception: pass
 
-    # --- DEFINE HANDLERS BEFORE SERVER ---
-    
+    # --- 4. DEFINE HANDLERS ---
     async def process_event(event):
         if event.sender_id == BOT_ID: return 
         clean_id = get_clean_id(event.chat_id)
@@ -300,10 +315,6 @@ async def main():
             await broadcast_signal(parsed)
             if is_new: await send_telegram_alert(parsed)
 
-    # Register Handlers
-    client.add_event_handler(process_event, events.NewMessage)
-    client.add_event_handler(process_event, events.MessageEdited)
-    
     async def del_msg(event):
         if not event.chat_id: return
         clean_id = get_clean_id(event.chat_id)
@@ -313,22 +324,12 @@ async def main():
                 delete_signal(unique_id)
                 await broadcast_signal(unique_id, delete_action=True)
 
+    # Register Handlers
+    client.add_event_handler(process_event, events.NewMessage)
+    client.add_event_handler(process_event, events.MessageEdited)
     client.add_event_handler(del_msg, events.MessageDeleted)
 
-    # --- START SERVER ---
-    logger.info(f"🚀 Starting Server on port {PORT}...")
-    
-    # Start WebSocket Server
-    server = await websockets.serve(
-        websocket_handler, 
-        "0.0.0.0", 
-        PORT, 
-        process_request=health_check, 
-        ping_interval=20, 
-        ping_timeout=20
-    )
-    
-    # Run Backfill
+    # --- 5. START TASKS ---
     asyncio.create_task(perform_backfill(client, valid_channels_set))
     
     # Keep Running
