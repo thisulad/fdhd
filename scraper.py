@@ -30,7 +30,6 @@ try:
 except (AttributeError, IndexError, ValueError):
     BOT_ID = 0
 
-# Channels to monitor
 CHANNELS = {
     'public': ['Binancesignalwithishara', 'me'], 
     'vip': [-1002138095358] 
@@ -79,28 +78,21 @@ PATTERNS = {
     'leverage': r'(?:Lev(?:erage)?\s*|Margin\s*)?[:\s]*((?:Cross|Iso|Isolated)?\s*[0-9]+x?)',
 }
 
-# --- DATABASE FUNCTIONS ---
+# --- HELPER FUNCTIONS ---
 
 def is_deleted(signal_id):
-    """Check if this ID was previously deleted"""
     return deleted_collection.find_one({'id': signal_id}) is not None
 
 def save_signal_to_db(signal_data):
     if not signal_data or 'id' not in signal_data: return False
-    # Check if deleted before (Backfill protection)
     if is_deleted(signal_data['id']): return False
-
     try:
-        # Check existence first
         existing = signals_collection.find_one({'id': signal_data['id']})
-        
-        # Save/Update
         signals_collection.update_one(
             {'id': signal_data['id']}, 
             {'$set': signal_data}, 
             upsert=True
         )
-        # If no existing record, it's NEW
         return existing is None
     except PyMongoError as e:
         logger.error(f"⚠️ DB Save Error: {e}")
@@ -110,9 +102,7 @@ def get_recent_history(limit=50):
     try:
         cursor = signals_collection.find({}, {'_id': 0}).sort("timestamp", -1).limit(limit)
         return list(cursor)
-    except PyMongoError as e:
-        logger.error(f"⚠️ DB Fetch Error: {e}")
-        return []
+    except PyMongoError: return []
 
 def delete_signal(signal_id):
     try:
@@ -123,10 +113,8 @@ def delete_signal(signal_id):
             upsert=True
         )
         logger.info(f"🗑️ Deleted signal {signal_id}")
-    except PyMongoError as e:
-        logger.error(f"⚠️ DB Delete Error: {e}")
+    except PyMongoError: pass
 
-# --- PARSING ENGINE ---
 def parse_signal(text, timestamp=None, custom_id=None):
     if not text: return None
     clean_text = text.replace('**', '').replace('__', '').replace('`', '').strip()
@@ -135,24 +123,18 @@ def parse_signal(text, timestamp=None, custom_id=None):
     if not pair_match: return None 
     
     raw_pair = pair_match.group(1).upper().replace('/', '')
-    
     if raw_pair in BLACKLIST_PAIRS or len(raw_pair) < 3: return None
     
     is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
     has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
-    
-    if not is_major and not has_direction:
-        return None
+    if not is_major and not has_direction: return None
 
     ts = timestamp if timestamp else time.time()
     sig_id = str(custom_id) if custom_id else str(int(ts * 1000))
 
     signal = {
-        'id': sig_id,
-        'pair': raw_pair,
-        'raw_text': clean_text,
-        'timestamp': ts,
-        'status': 'pending'
+        'id': sig_id, 'pair': raw_pair, 'raw_text': clean_text,
+        'timestamp': ts, 'status': 'pending'
     }
 
     if dir_match := re.search(PATTERNS['direction'], clean_text, re.IGNORECASE):
@@ -180,7 +162,6 @@ def parse_signal(text, timestamp=None, custom_id=None):
 def get_clean_id(id_value):
     return abs(int(id_value)) if id_value is not None else 0
 
-# --- BACKFILL ---
 async def perform_backfill(client, valid_channels):
     logger.info("⏳ Backfilling history (Background Task)...")
     count = 0
@@ -193,7 +174,6 @@ async def perform_backfill(client, valid_channels):
             async for message in client.iter_messages(channel_id, limit=50):
                 if not message.text or "🔎 _Source:" in message.text: continue
                 unique_id = f"tg_{channel_id}_{message.id}"
-                
                 if is_deleted(unique_id): continue
                 
                 parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id)
@@ -202,24 +182,15 @@ async def perform_backfill(client, valid_channels):
                     parsed['source'] = 'Backfill'
                     save_signal_to_db(parsed)
                     count += 1
-        except Exception as e:
-            logger.error(f"⚠️ Backfill error on {channel_id}: {e}")
-            
+        except Exception: pass
     logger.info(f"✅ Backfill Done. Synced {count} signals.")
 
-# --- WEBSOCKET & NOTIFICATION ---
 async def broadcast_signal(signal_data, delete_action=False):
     if not connected_clients: return
     try:
-        if delete_action:
-            msg = json.dumps({"action": "delete", "id": signal_data})
-        else:
-            clean_data = {k:v for k,v in signal_data.items() if k != '_id'}
-            msg = json.dumps(clean_data)
-            
+        msg = json.dumps({"action": "delete", "id": signal_data}) if delete_action else json.dumps({k:v for k,v in signal_data.items() if k != '_id'})
         await asyncio.gather(*[client.send(msg) for client in connected_clients], return_exceptions=True)
-    except Exception as e:
-        logger.error(f"⚠️ Broadcast Error: {e}")
+    except Exception: pass
 
 def send_via_http(token, chat_id, message):
     try:
@@ -266,18 +237,16 @@ async def websocket_handler(websocket):
                     await send_telegram_alert(payload)
             except json.JSONDecodeError: pass
     except websockets.exceptions.ConnectionClosed: pass
-    except Exception as e: logger.error(f"WS Error: {e}")
+    except Exception: pass
     finally:
         connected_clients.remove(websocket)
 
 async def health_check(connection, request):
-    # Renders Default Check is "/"
-    # Uptime Bots Check is "/health"
     if request.path == "/health" or request.path == "/":
         return http.HTTPStatus.OK, [], b"OK"
     return None
 
-# --- MAIN ---
+# --- MAIN (Refactored to Avoid SyntaxError) ---
 async def main():
     global client
     
@@ -290,58 +259,89 @@ async def main():
     except Exception as e:
         logger.critical(f"❌ Session Error: {e}")
         sys.exit(1)
+
+    logger.info("Connecting to Telegram...")
+    await client.start()
     
-    # --- FIX: Start WebSocket Server FIRST to satisfy Render Port Scan ---
+    valid_channels_set = set()
+    all_chat_ids = CHANNELS['public'] + CHANNELS['vip']
+    
+    for chat in all_chat_ids:
+        try:
+            entity = await client.get_entity(chat)
+            clean_id = get_clean_id(entity.id)
+            valid_channels_set.add(clean_id)
+            logger.info(f"   ✅ Verified: {getattr(entity, 'title', chat)} [ID: {clean_id}]")
+        except Exception: pass
+
+    # --- DEFINE HANDLERS BEFORE SERVER ---
+    
+    async def process_event(event):
+        if event.sender_id == BOT_ID: return 
+        clean_id = get_clean_id(event.chat_id)
+        if clean_id not in valid_channels_set and not event.is_private: return
+
+        unique_id = f"tg_{clean_id}_{event.id}"
+        if is_deleted(unique_id): return
+
+        parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
+        
+        if parsed:
+            if clean_id in valid_channels_set:
+                 vip_ids = [get_clean_id(x) for x in CHANNELS['vip']]
+                 parsed['type'] = 'VIP' if (clean_id in vip_ids) else 'Public'
+                 chat_obj = await event.get_chat()
+                 parsed['source'] = getattr(chat_obj, 'title', 'Channel')
+            else:
+                 parsed['source'] = 'Saved/Private'
+                 parsed['type'] = 'Manual'
+
+            is_new = save_signal_to_db(parsed)
+            await broadcast_signal(parsed)
+            if is_new: await send_telegram_alert(parsed)
+
+    # Register Handlers
+    client.add_event_handler(process_event, events.NewMessage)
+    client.add_event_handler(process_event, events.MessageEdited)
+    
+    async def del_msg(event):
+        if not event.chat_id: return
+        clean_id = get_clean_id(event.chat_id)
+        if clean_id in valid_channels_set:
+            for msg_id in event.deleted_ids:
+                unique_id = f"tg_{clean_id}_{msg_id}"
+                delete_signal(unique_id)
+                await broadcast_signal(unique_id, delete_action=True)
+
+    client.add_event_handler(del_msg, events.MessageDeleted)
+
+    # --- START SERVER ---
     logger.info(f"🚀 Starting Server on port {PORT}...")
     
-    # We open the server context here, wrapping the entire Telegram Logic
-    async with websockets.serve(
+    # Start WebSocket Server
+    server = await websockets.serve(
         websocket_handler, 
         "0.0.0.0", 
         PORT, 
         process_request=health_check, 
         ping_interval=20, 
         ping_timeout=20
-    ):
-        # NOW we connect to Telegram (If this takes time, the port is already open)
-        logger.info("Connecting to Telegram...")
-        await client.start()
-        logger.info("✅ Telegram Connected")
+    )
+    
+    # Run Backfill
+    asyncio.create_task(perform_backfill(client, valid_channels_set))
+    
+    # Keep Running
+    try:
+        await client.run_until_disconnected()
+    finally:
+        server.close()
+        await server.wait_closed()
 
-        valid_channels_set = set()
-        all_chat_ids = CHANNELS['public'] + CHANNELS['vip']
-        
-        for chat in all_chat_ids:
-            try:
-                entity = await client.get_entity(chat)
-                clean_id = get_clean_id(entity.id)
-                valid_channels_set.add(clean_id)
-                logger.info(f"   ✅ Verified: {getattr(entity, 'title', chat)} [ID: {clean_id}]")
-            except Exception: pass
-
-        async def process_event(event):
-            if event.sender_id == BOT_ID: return 
-            clean_id = get_clean_id(event.chat_id)
-            if clean_id not in valid_channels_set and not event.is_private: return
-
-            unique_id = f"tg_{clean_id}_{event.id}"
-            if is_deleted(unique_id): return
-
-            parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
-            
-            if parsed:
-                if clean_id in valid_channels_set:
-                     vip_ids = [get_clean_id(x) for x in CHANNELS['vip']]
-                     parsed['type'] = 'VIP' if (clean_id in vip_ids) else 'Public'
-                     chat_obj = await event.get_chat()
-                     parsed['source'] = getattr(chat_obj, 'title', 'Channel')
-                else:
-                     parsed['source'] = 'Saved/Private'
-                     parsed['type'] = 'Manual'
-
-                is_new = save_signal_to_db(parsed)
-                await broadcast_signal(parsed)
-                if is_new: await send_telegram_alert(parsed)
-
-        @client.on(events.NewMessage)
-        async
+if __name__ == '__main__':
+    loggers = ["websockets", "websockets.server", "websockets.protocol", "websockets.asyncio.server", "asyncio"]
+    for l in loggers: logging.getLogger(l).setLevel(logging.CRITICAL)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
