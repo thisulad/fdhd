@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 # --- MONGODB CONNECTION ---
 if not MONGO_URI:
-    logger.critical("❌ FATAL: MONGO_URI is missing from Environment Variables.")
+    logger.critical("❌ FATAL: MONGO_URI is missing.")
     sys.exit(1)
 
 try:
@@ -82,19 +82,25 @@ PATTERNS = {
 # --- DATABASE FUNCTIONS ---
 
 def is_deleted(signal_id):
+    """Check if this ID was previously deleted"""
     return deleted_collection.find_one({'id': signal_id}) is not None
 
 def save_signal_to_db(signal_data):
     if not signal_data or 'id' not in signal_data: return False
+    # Check if deleted before (Backfill protection)
     if is_deleted(signal_data['id']): return False
 
     try:
+        # Check existence first
         existing = signals_collection.find_one({'id': signal_data['id']})
+        
+        # Save/Update
         signals_collection.update_one(
             {'id': signal_data['id']}, 
             {'$set': signal_data}, 
             upsert=True
         )
+        # If no existing record, it's NEW
         return existing is None
     except PyMongoError as e:
         logger.error(f"⚠️ DB Save Error: {e}")
@@ -265,6 +271,8 @@ async def websocket_handler(websocket):
         connected_clients.remove(websocket)
 
 async def health_check(connection, request):
+    # Renders Default Check is "/"
+    # Uptime Bots Check is "/health"
     if request.path == "/health" or request.path == "/":
         return http.HTTPStatus.OK, [], b"OK"
     return None
@@ -273,12 +281,9 @@ async def health_check(connection, request):
 async def main():
     global client
     
-    # CRITICAL CHECK FOR RENDER
     if not SESSION_STRING:
         logger.critical("❌ CRITICAL ERROR: SESSION_STRING missing.")
-        logger.critical("   Please run gen.py locally to get your string.")
-        logger.critical("   Then add it to Render Environment Variables.")
-        sys.exit(1) # Intentionally crash here if missing
+        sys.exit(1)
 
     try:
         client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -287,7 +292,7 @@ async def main():
         sys.exit(1)
 
     logger.info("Connecting to Telegram...")
-    await client.start() # This requires SESSION_STRING to be valid
+    await client.start()
     
     valid_channels_set = set()
     all_chat_ids = CHANNELS['public'] + CHANNELS['vip']
@@ -354,8 +359,19 @@ async def main():
         await client.run_until_disconnected()
 
 if __name__ == '__main__':
-    logging.getLogger("websockets.server").setLevel(logging.ERROR)
-    logging.getLogger("websockets.protocol").setLevel(logging.ERROR)
+    # --- NUCLEAR LOG SUPPRESSION (Updated for your errors) ---
+    # We explicitly silence the library that is spamming "got HEAD"
+    # This does not fix the bot sending HEAD, but it hides the error.
+    loggers = [
+        "websockets",
+        "websockets.server",
+        "websockets.protocol",
+        "websockets.asyncio.server", 
+        "asyncio"
+    ]
+    for l in loggers:
+        logging.getLogger(l).setLevel(logging.CRITICAL)
+        
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
