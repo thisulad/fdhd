@@ -204,3 +204,87 @@ async def perform_backfill(client, valid_channels):
     for channel_id in valid_channels:
         try:
             async for message in client.iter_messages(channel_id, limit=50):
+                if not message.text or "🔎 _Source:" in message.text: continue
+                unique_id = f"tg_{channel_id}_{message.id}"
+                
+                if is_deleted(unique_id): continue
+                
+                parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id)
+                if parsed:
+                    parsed['type'] = 'VIP' if (channel_id in vip_clean_ids) else 'Public'
+                    parsed['source'] = 'Backfill'
+                    # Just save, don't alert
+                    save_signal_to_db(parsed)
+                    count += 1
+        except Exception as e:
+            logger.error(f"⚠️ Backfill error on {channel_id}: {e}")
+            
+    logger.info(f"✅ Backfill Done. Synced {count} signals.")
+
+# --- WEBSOCKET & NOTIFICATION ---
+async def broadcast_signal(signal_data, delete_action=False):
+    if not connected_clients: return
+    try:
+        if delete_action:
+            msg = json.dumps({"action": "delete", "id": signal_data})
+        else:
+            clean_data = {k:v for k,v in signal_data.items() if k != '_id'}
+            msg = json.dumps(clean_data)
+            
+        await asyncio.gather(*[client.send(msg) for client in connected_clients], return_exceptions=True)
+    except Exception as e:
+        logger.error(f"⚠️ Broadcast Error: {e}")
+
+def send_via_http(token, chat_id, message):
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
+        encoded = urllib.parse.urlencode(data).encode('utf-8')
+        req = urllib.request.Request(url, data=encoded)
+        with urllib.request.urlopen(req) as response: pass
+    except Exception: pass
+
+async def send_telegram_alert(signal):
+    if not BOT_TOKEN or not BOT_CHAT_ID: return
+    emoji = "🟢" if signal.get('direction') == 'Long' else "🔴"
+    targets_str = "\n".join([f"   🎯 {t}" for t in signal['targets']])
+    
+    msg = (f"⚡ **{signal['pair']}** {emoji} **{signal['direction'].upper()}**\n\n"
+           f"📥 **Entry:** {signal['entry']}\n"
+           f"⚙️ **Lev:** {signal['leverage']}\n\n"
+           f"**Targets:**\n{targets_str}\n\n"
+           f"🔎 _Source: {signal.get('source', 'Unknown')}_")
+    
+    await asyncio.to_thread(send_via_http, BOT_TOKEN, BOT_CHAT_ID, msg)
+
+async def websocket_handler(websocket):
+    logger.info("✅ Dashboard Connected")
+    connected_clients.add(websocket)
+    
+    history = get_recent_history(50)
+    for old_signal in reversed(history):
+        await websocket.send(json.dumps(old_signal))
+        
+    try:
+        async for message in websocket:
+            try:
+                data = json.loads(message)
+                action = data.get('action')
+                if action == 'delete':
+                    delete_signal(data.get('id'))
+                    await broadcast_signal(data.get('id'), delete_action=True)
+                elif action == 'add':
+                    logger.info(f"➕ Manual Signal")
+                    payload = data.get('payload')
+                    if 'id' not in payload: payload['id'] = f"man_{int(time.time()*1000)}"
+                    payload['source'] = 'Manual'
+                    save_signal_to_db(payload)
+                    await broadcast_signal(payload)
+                    await send_telegram_alert(payload)
+            except json.JSONDecodeError: pass
+    except websockets.exceptions.ConnectionClosed: pass
+    except Exception as e: logger.error(f"WS Error: {e}")
+    finally:
+        connected_clients.remove(websocket)
+
+# --- HEALTH
