@@ -24,6 +24,11 @@ SESSION_STRING = os.environ.get('SESSION_STRING', '')
 MONGO_URI = os.environ.get('MONGO_URI') 
 PORT = int(os.environ.get("PORT", 8765))
 
+# Global DB Variables (Initialized later to prevent blocking)
+mongo_client = None
+signals_collection = None
+deleted_collection = None
+
 # Safety: Extract Bot ID
 try:
     BOT_ID = int(BOT_TOKEN.split(':')[0])
@@ -42,22 +47,6 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
-
-# --- MONGODB CONNECTION ---
-if not MONGO_URI:
-    logger.critical("❌ FATAL: MONGO_URI is missing.")
-    sys.exit(1)
-
-try:
-    mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
-    db = mongo_client["crypto_scraper"]
-    signals_collection = db["signals"]
-    deleted_collection = db["deleted_signals"]
-    mongo_client.admin.command('ping')
-    logger.info("✅ MongoDB Atlas Connected Successfully")
-except Exception as e:
-    logger.critical(f"❌ MongoDB Connection Failed: {e}")
-    sys.exit(1)
 
 connected_clients = set()
 
@@ -81,9 +70,11 @@ PATTERNS = {
 # --- HELPER FUNCTIONS ---
 
 def is_deleted(signal_id):
+    if deleted_collection is None: return False
     return deleted_collection.find_one({'id': signal_id}) is not None
 
 def save_signal_to_db(signal_data):
+    if signals_collection is None: return False
     if not signal_data or 'id' not in signal_data: return False
     if is_deleted(signal_data['id']): return False
     try:
@@ -99,12 +90,14 @@ def save_signal_to_db(signal_data):
         return False
 
 def get_recent_history(limit=50):
+    if signals_collection is None: return []
     try:
         cursor = signals_collection.find({}, {'_id': 0}).sort("timestamp", -1).limit(limit)
         return list(cursor)
     except PyMongoError: return []
 
 def delete_signal(signal_id):
+    if signals_collection is None: return
     try:
         signals_collection.delete_one({'id': str(signal_id)})
         deleted_collection.update_one(
@@ -163,6 +156,10 @@ def get_clean_id(id_value):
     return abs(int(id_value)) if id_value is not None else 0
 
 async def perform_backfill(client, valid_channels):
+    # Wait for DB to be ready
+    while signals_collection is None:
+        await asyncio.sleep(1)
+        
     logger.info("⏳ Backfilling history (Background Task)...")
     count = 0
     vip_clean_ids = set()
@@ -215,12 +212,16 @@ async def send_telegram_alert(signal):
 async def websocket_handler(websocket):
     logger.info("✅ Dashboard Connected")
     connected_clients.add(websocket)
-    history = get_recent_history(50)
-    for old_signal in reversed(history):
-        await websocket.send(json.dumps(old_signal))
+    
+    # Send history if DB is ready
+    if signals_collection is not None:
+        history = get_recent_history(50)
+        for old_signal in reversed(history):
+            await websocket.send(json.dumps(old_signal))
         
     try:
         async for message in websocket:
+            if signals_collection is None: continue # Ignore inputs if DB not ready
             try:
                 data = json.loads(message)
                 action = data.get('action')
@@ -242,19 +243,17 @@ async def websocket_handler(websocket):
         connected_clients.remove(websocket)
 
 async def health_check(connection, request):
-    # Allows Render AND Uptime bots to pass
     if request.path == "/health" or request.path == "/":
         return http.HTTPStatus.OK, [], b"OK"
     return None
 
 # --- MAIN ---
 async def main():
-    global client
+    global mongo_client, signals_collection, deleted_collection
     
-    # --- 1. START SERVER FIRST (CRITICAL FIX FOR RENDER) ---
-    # We start the server immediately so Render detects an open port.
+    # 1. START SERVER INSTANTLY (Non-Blocking)
+    # This is critical for Render. The port must be open BEFORE connecting to DB or Telegram.
     logger.info(f"🚀 Starting Server on port {PORT}...")
-    
     server = await websockets.serve(
         websocket_handler, 
         "0.0.0.0", 
@@ -264,80 +263,86 @@ async def main():
         ping_timeout=20
     )
 
-    # --- 2. AUTHENTICATE TELEGRAM ---
-    if not SESSION_STRING:
-        logger.critical("❌ FATAL: SESSION_STRING missing.")
-        sys.exit(1)
-
-    try:
-        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    except Exception as e:
-        logger.critical(f"❌ Session Error: {e}")
-        sys.exit(1)
-
-    logger.info("Connecting to Telegram...")
-    await client.start()
-    
-    valid_channels_set = set()
-    all_chat_ids = CHANNELS['public'] + CHANNELS['vip']
-    
-    # --- 3. RESOLVE CHANNELS ---
-    for chat in all_chat_ids:
-        try:
-            entity = await client.get_entity(chat)
-            clean_id = get_clean_id(entity.id)
-            valid_channels_set.add(clean_id)
-            logger.info(f"   ✅ Verified: {getattr(entity, 'title', chat)} [ID: {clean_id}]")
-        except Exception: pass
-
-    # --- 4. DEFINE HANDLERS ---
-    async def process_event(event):
-        if event.sender_id == BOT_ID: return 
-        clean_id = get_clean_id(event.chat_id)
-        if clean_id not in valid_channels_set and not event.is_private: return
-
-        unique_id = f"tg_{clean_id}_{event.id}"
-        if is_deleted(unique_id): return
-
-        parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
+    # 2. START HEAVY LIFTERS IN BACKGROUND
+    async def bootstrap_app():
+        global mongo_client, signals_collection, deleted_collection
         
-        if parsed:
-            if clean_id in valid_channels_set:
-                 vip_ids = [get_clean_id(x) for x in CHANNELS['vip']]
-                 parsed['type'] = 'VIP' if (clean_id in vip_ids) else 'Public'
-                 chat_obj = await event.get_chat()
-                 parsed['source'] = getattr(chat_obj, 'title', 'Channel')
-            else:
-                 parsed['source'] = 'Saved/Private'
-                 parsed['type'] = 'Manual'
+        # A. Connect DB
+        logger.info("🔌 Connecting to MongoDB...")
+        if not MONGO_URI: return
+        try:
+            mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
+            db = mongo_client["crypto_scraper"]
+            signals_collection = db["signals"]
+            deleted_collection = db["deleted_signals"]
+            await asyncio.to_thread(mongo_client.admin.command, 'ping')
+            logger.info("✅ MongoDB Connected")
+        except Exception as e:
+            logger.critical(f"❌ DB Fail: {e}")
+            return # Exit background task, but server stays alive so Render doesn't crash
 
-            is_new = save_signal_to_db(parsed)
-            await broadcast_signal(parsed)
-            if is_new: await send_telegram_alert(parsed)
+        # B. Connect Telegram
+        if not SESSION_STRING: return
+        try:
+            client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+            logger.info("🔌 Connecting to Telegram...")
+            await client.start()
+            logger.info("✅ Telegram Connected")
+            
+            # Setup Handlers
+            valid_channels_set = set()
+            for chat in CHANNELS['public'] + CHANNELS['vip']:
+                try:
+                    entity = await client.get_entity(chat)
+                    valid_channels_set.add(get_clean_id(entity.id))
+                except: pass
 
-    async def del_msg(event):
-        if not event.chat_id: return
-        clean_id = get_clean_id(event.chat_id)
-        if clean_id in valid_channels_set:
-            for msg_id in event.deleted_ids:
-                unique_id = f"tg_{clean_id}_{msg_id}"
-                delete_signal(unique_id)
-                await broadcast_signal(unique_id, delete_action=True)
+            async def process_event(event):
+                if event.sender_id == BOT_ID: return 
+                clean_id = get_clean_id(event.chat_id)
+                if clean_id not in valid_channels_set and not event.is_private: return
+                unique_id = f"tg_{clean_id}_{event.id}"
+                if is_deleted(unique_id): return
+                parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
+                if parsed:
+                    if clean_id in valid_channels_set:
+                        vip_ids = [get_clean_id(x) for x in CHANNELS['vip']]
+                        parsed['type'] = 'VIP' if (clean_id in vip_ids) else 'Public'
+                        chat_obj = await event.get_chat()
+                        parsed['source'] = getattr(chat_obj, 'title', 'Channel')
+                    else:
+                        parsed['source'] = 'Saved/Private'; parsed['type'] = 'Manual'
+                    is_new = save_signal_to_db(parsed)
+                    await broadcast_signal(parsed)
+                    if is_new: await send_telegram_alert(parsed)
 
-    # Register Handlers
-    client.add_event_handler(process_event, events.NewMessage)
-    client.add_event_handler(process_event, events.MessageEdited)
-    client.add_event_handler(del_msg, events.MessageDeleted)
+            client.add_event_handler(process_event, events.NewMessage)
+            client.add_event_handler(process_event, events.MessageEdited)
+            
+            async def del_msg(event):
+                if not event.chat_id: return
+                clean_id = get_clean_id(event.chat_id)
+                if clean_id in valid_channels_set:
+                    for msg_id in event.deleted_ids:
+                        unique_id = f"tg_{clean_id}_{msg_id}"
+                        delete_signal(unique_id)
+                        await broadcast_signal(unique_id, delete_action=True)
 
-    # --- 5. START TASKS ---
-    asyncio.create_task(perform_backfill(client, valid_channels_set))
-    
-    # Keep Running
-    try:
-        await client.run_until_disconnected()
-    finally:
-        server.close()
-        await server.wait_closed()
+            client.add_event_handler(del_msg, events.MessageDeleted)
+            
+            # Backfill
+            await perform_backfill(client, valid_channels_set)
+            
+            # Keep Client Alive
+            await client.run_until_disconnected()
+        except Exception as e:
+            logger.error(f"Telegram Error: {e}")
+
+    # Launch Background Task
+    asyncio.create_task(bootstrap_app())
+
+    # Keep Main Loop Alive Forever (For the Server)
+    await asyncio.get_running_loop().create_future()
 
 if __name__ == '__main__':
     loggers = ["websockets", "websockets.server", "websockets.protocol", "websockets.asyncio.server", "asyncio"]
