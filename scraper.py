@@ -24,7 +24,7 @@ SESSION_STRING = os.environ.get('SESSION_STRING', '')
 MONGO_URI = os.environ.get('MONGO_URI') 
 PORT = int(os.environ.get("PORT", 8765))
 
-# Global DB Variables (Initialized later to prevent blocking)
+# Global DB Variables
 mongo_client = None
 signals_collection = None
 deleted_collection = None
@@ -156,7 +156,6 @@ def get_clean_id(id_value):
     return abs(int(id_value)) if id_value is not None else 0
 
 async def perform_backfill(client, valid_channels):
-    # Wait for DB to be ready
     while signals_collection is None:
         await asyncio.sleep(1)
         
@@ -213,7 +212,6 @@ async def websocket_handler(websocket):
     logger.info("✅ Dashboard Connected")
     connected_clients.add(websocket)
     
-    # Send history if DB is ready
     if signals_collection is not None:
         history = get_recent_history(50)
         for old_signal in reversed(history):
@@ -221,7 +219,7 @@ async def websocket_handler(websocket):
         
     try:
         async for message in websocket:
-            if signals_collection is None: continue # Ignore inputs if DB not ready
+            if signals_collection is None: continue 
             try:
                 data = json.loads(message)
                 action = data.get('action')
@@ -242,32 +240,24 @@ async def websocket_handler(websocket):
     finally:
         connected_clients.remove(websocket)
 
-async def health_check(connection, request):
-    if request.path == "/health" or request.path == "/":
-        return http.HTTPStatus.OK, [], b"OK"
-    return None
-
 # --- MAIN ---
 async def main():
     global mongo_client, signals_collection, deleted_collection
     
-    # 1. START SERVER INSTANTLY (Non-Blocking)
-    # This is critical for Render. The port must be open BEFORE connecting to DB or Telegram.
+    # 1. START SERVER INSTANTLY (NO HEALTH CHECK ARGUMENT)
     logger.info(f"🚀 Starting Server on port {PORT}...")
     server = await websockets.serve(
         websocket_handler, 
         "0.0.0.0", 
         PORT, 
-        process_request=health_check, 
         ping_interval=20, 
         ping_timeout=20
     )
 
-    # 2. START HEAVY LIFTERS IN BACKGROUND
+    # 2. START BACKGROUND TASKS
     async def bootstrap_app():
         global mongo_client, signals_collection, deleted_collection
         
-        # A. Connect DB
         logger.info("🔌 Connecting to MongoDB...")
         if not MONGO_URI: return
         try:
@@ -279,9 +269,8 @@ async def main():
             logger.info("✅ MongoDB Connected")
         except Exception as e:
             logger.critical(f"❌ DB Fail: {e}")
-            return # Exit background task, but server stays alive so Render doesn't crash
+            return
 
-        # B. Connect Telegram
         if not SESSION_STRING: return
         try:
             client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -289,7 +278,6 @@ async def main():
             await client.start()
             logger.info("✅ Telegram Connected")
             
-            # Setup Handlers
             valid_channels_set = set()
             for chat in CHANNELS['public'] + CHANNELS['vip']:
                 try:
@@ -329,19 +317,12 @@ async def main():
                         await broadcast_signal(unique_id, delete_action=True)
 
             client.add_event_handler(del_msg, events.MessageDeleted)
-            
-            # Backfill
             await perform_backfill(client, valid_channels_set)
-            
-            # Keep Client Alive
             await client.run_until_disconnected()
         except Exception as e:
             logger.error(f"Telegram Error: {e}")
 
-    # Launch Background Task
     asyncio.create_task(bootstrap_app())
-
-    # Keep Main Loop Alive Forever (For the Server)
     await asyncio.get_running_loop().create_future()
 
 if __name__ == '__main__':
