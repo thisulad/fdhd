@@ -72,7 +72,6 @@ BLACKLIST_PAIRS = {
 }
 
 PATTERNS = {
-    # STRICTER PAIR REGEX
     'pair_strict': r'(?:\#|\$)?([A-Z0-9]{2,8}(?:/[A-Z0-9]{2,8})?)',
     'direction': r'\b(Long|Short|Buy|Sell)\b',
     'entry': r'(?:Entry|Buy|EP|Enter)(?:\s*(?:Zone|Range|Price|Target)?)?[\s:-]*([0-9\.,\s\-]+)',
@@ -83,33 +82,20 @@ PATTERNS = {
 # --- DATABASE FUNCTIONS ---
 
 def is_deleted(signal_id):
-    """Check if this ID was previously deleted manually"""
     return deleted_collection.find_one({'id': signal_id}) is not None
 
 def save_signal_to_db(signal_data):
-    """
-    Upsert signal. 
-    Returns: True if this is a NEW signal, False if it was just an update.
-    """
     if not signal_data or 'id' not in signal_data: return False
-    
-    # Check if deleted before (Backfill protection)
     if is_deleted(signal_data['id']): return False
 
     try:
-        # Check existence first
         existing = signals_collection.find_one({'id': signal_data['id']})
-        
-        # Save/Update
         signals_collection.update_one(
             {'id': signal_data['id']}, 
             {'$set': signal_data}, 
             upsert=True
         )
-        
-        # If no existing record, it's NEW
         return existing is None
-        
     except PyMongoError as e:
         logger.error(f"⚠️ DB Save Error: {e}")
         return False
@@ -124,9 +110,7 @@ def get_recent_history(limit=50):
 
 def delete_signal(signal_id):
     try:
-        # Remove from active signals
         signals_collection.delete_one({'id': str(signal_id)})
-        # Add to deleted list (Backfill ban)
         deleted_collection.update_one(
             {'id': str(signal_id)}, 
             {'$set': {'id': str(signal_id), 'deleted_at': time.time()}}, 
@@ -141,20 +125,16 @@ def parse_signal(text, timestamp=None, custom_id=None):
     if not text: return None
     clean_text = text.replace('**', '').replace('__', '').replace('`', '').strip()
     
-    # 1. Find Potential Pair
     pair_match = re.search(PATTERNS['pair_strict'], clean_text, re.IGNORECASE)
     if not pair_match: return None 
     
     raw_pair = pair_match.group(1).upper().replace('/', '')
     
-    # 2. Blacklist Check
     if raw_pair in BLACKLIST_PAIRS or len(raw_pair) < 3: return None
     
-    # 3. Context Check (The "Random Word" Killer)
     is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
     has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
     
-    # If it's a random word like "MINUTS" (no USD, no Direction nearby), SKIP IT
     if not is_major and not has_direction:
         return None
 
@@ -191,7 +171,6 @@ def parse_signal(text, timestamp=None, custom_id=None):
 
     return signal
 
-# --- HELPER: ID NORMALIZER ---
 def get_clean_id(id_value):
     return abs(int(id_value)) if id_value is not None else 0
 
@@ -208,15 +187,12 @@ async def perform_backfill(client, valid_channels):
             async for message in client.iter_messages(channel_id, limit=50):
                 if not message.text or "🔎 _Source:" in message.text: continue
                 unique_id = f"tg_{channel_id}_{message.id}"
-                
-                # Skip if manually deleted
                 if is_deleted(unique_id): continue
                 
                 parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id)
                 if parsed:
                     parsed['type'] = 'VIP' if (channel_id in vip_clean_ids) else 'Public'
                     parsed['source'] = 'Backfill'
-                    # Just save, don't alert
                     save_signal_to_db(parsed)
                     count += 1
         except Exception as e:
@@ -264,7 +240,6 @@ async def websocket_handler(websocket):
     logger.info("✅ Dashboard Connected")
     connected_clients.add(websocket)
     
-    # Send history
     history = get_recent_history(50)
     for old_signal in reversed(history):
         await websocket.send(json.dumps(old_signal))
@@ -282,7 +257,6 @@ async def websocket_handler(websocket):
                     payload = data.get('payload')
                     if 'id' not in payload: payload['id'] = f"man_{int(time.time()*1000)}"
                     payload['source'] = 'Manual'
-                    
                     save_signal_to_db(payload)
                     await broadcast_signal(payload)
                     await send_telegram_alert(payload)
@@ -292,16 +266,16 @@ async def websocket_handler(websocket):
     finally:
         connected_clients.remove(websocket)
 
-async def health_check(path, request_headers):
-    if path == "/health":
+# --- NEW: HEALTH CHECK (COMPATIBLE WITH NEW WEBSOCKETS LIB) ---
+async def health_check(connection, request):
+    # This handles the Render "GET /health" check
+    if request.path == "/health":
         return http.HTTPStatus.OK, [], b"OK"
     return None
 
 # --- MAIN ---
 async def main():
     global client
-    
-    # 1. Start Client
     if SESSION_STRING:
         try:
             client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -312,10 +286,8 @@ async def main():
     logger.info("Connecting to Telegram...")
     await client.start()
     
-    # 2. Resolve Channels
     valid_channels_set = set()
     all_chat_ids = CHANNELS['public'] + CHANNELS['vip']
-    
     for chat in all_chat_ids:
         try:
             entity = await client.get_entity(chat)
@@ -324,45 +296,30 @@ async def main():
             logger.info(f"   ✅ Verified: {getattr(entity, 'title', chat)} [ID: {clean_id}]")
         except Exception: pass
 
-    # 3. DEFINE EVENT PROCESSOR
     async def process_event(event):
         if event.sender_id == BOT_ID: return 
+        clean_id = get_clean_id(event.chat_id)
+        if clean_id not in valid_channels_set and not event.is_private: return
 
-        event_clean_id = get_clean_id(event.chat_id)
-        is_watched = event_clean_id in valid_channels_set
-        is_private = event.is_private
-
-        if not (is_watched or is_private): return
-
-        unique_id = f"tg_{event_clean_id}_{event.id}"
-        
-        # Check deletion list
+        unique_id = f"tg_{clean_id}_{event.id}"
         if is_deleted(unique_id): return
 
         parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
         
         if parsed:
-            if is_watched:
+            if clean_id in valid_channels_set:
                  vip_ids = [get_clean_id(x) for x in CHANNELS['vip']]
-                 parsed['type'] = 'VIP' if (event_clean_id in vip_ids) else 'Public'
+                 parsed['type'] = 'VIP' if (clean_id in vip_ids) else 'Public'
                  chat_obj = await event.get_chat()
                  parsed['source'] = getattr(chat_obj, 'title', 'Channel')
             else:
                  parsed['source'] = 'Saved/Private'
                  parsed['type'] = 'Manual'
 
-            # 1. SAVE & CHECK DUPLICATION
             is_new = save_signal_to_db(parsed)
-            
-            # 2. UPDATE DASHBOARD
             await broadcast_signal(parsed)
-            
-            # 3. ALERT (Only if fresh)
-            if is_new:
-                logger.info(f"🔔 FRESH ALERT: {parsed['pair']}")
-                await send_telegram_alert(parsed)
+            if is_new: await send_telegram_alert(parsed)
 
-    # Listeners
     @client.on(events.NewMessage)
     async def new_msg(e): await process_event(e)
 
@@ -381,7 +338,6 @@ async def main():
 
     logger.info(f"🚀 Starting Server on port {PORT}...")
     
-    # 4. START SERVER (FIX FOR RENDER TIMEOUT)
     # Ping interval keeps connection alive
     async with websockets.serve(
         websocket_handler, 
@@ -391,14 +347,13 @@ async def main():
         ping_interval=20, 
         ping_timeout=20
     ):
-        # 5. RUN BACKFILL IN BACKGROUND (This prevents timeout)
         asyncio.create_task(perform_backfill(client, valid_channels_set))
-        
-        # Keep Alive
         await client.run_until_disconnected()
 
 if __name__ == '__main__':
-    logging.getLogger("websockets.server").setLevel(logging.ERROR)
+    # SILENCE THE UPTIME BOT LOGS
+    logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
+    logging.getLogger("websockets.protocol").setLevel(logging.CRITICAL)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
