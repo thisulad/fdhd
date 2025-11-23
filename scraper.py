@@ -290,63 +290,11 @@ async def main():
     except Exception as e:
         logger.critical(f"❌ Session Error: {e}")
         sys.exit(1)
-
-    logger.info("Connecting to Telegram...")
-    await client.start()
     
-    valid_channels_set = set()
-    all_chat_ids = CHANNELS['public'] + CHANNELS['vip']
-    
-    for chat in all_chat_ids:
-        try:
-            entity = await client.get_entity(chat)
-            clean_id = get_clean_id(entity.id)
-            valid_channels_set.add(clean_id)
-            logger.info(f"   ✅ Verified: {getattr(entity, 'title', chat)} [ID: {clean_id}]")
-        except Exception: pass
-
-    async def process_event(event):
-        if event.sender_id == BOT_ID: return 
-        clean_id = get_clean_id(event.chat_id)
-        if clean_id not in valid_channels_set and not event.is_private: return
-
-        unique_id = f"tg_{clean_id}_{event.id}"
-        if is_deleted(unique_id): return
-
-        parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
-        
-        if parsed:
-            if clean_id in valid_channels_set:
-                 vip_ids = [get_clean_id(x) for x in CHANNELS['vip']]
-                 parsed['type'] = 'VIP' if (clean_id in vip_ids) else 'Public'
-                 chat_obj = await event.get_chat()
-                 parsed['source'] = getattr(chat_obj, 'title', 'Channel')
-            else:
-                 parsed['source'] = 'Saved/Private'
-                 parsed['type'] = 'Manual'
-
-            is_new = save_signal_to_db(parsed)
-            await broadcast_signal(parsed)
-            if is_new: await send_telegram_alert(parsed)
-
-    @client.on(events.NewMessage)
-    async def new_msg(e): await process_event(e)
-
-    @client.on(events.MessageEdited)
-    async def edit_msg(e): await process_event(e)
-    
-    @client.on(events.MessageDeleted)
-    async def del_msg(event):
-        if not event.chat_id: return
-        clean_id = get_clean_id(event.chat_id)
-        if clean_id in valid_channels_set:
-            for msg_id in event.deleted_ids:
-                unique_id = f"tg_{clean_id}_{msg_id}"
-                delete_signal(unique_id)
-                await broadcast_signal(unique_id, delete_action=True)
-
+    # --- FIX: Start WebSocket Server FIRST to satisfy Render Port Scan ---
     logger.info(f"🚀 Starting Server on port {PORT}...")
     
+    # We open the server context here, wrapping the entire Telegram Logic
     async with websockets.serve(
         websocket_handler, 
         "0.0.0.0", 
@@ -355,24 +303,45 @@ async def main():
         ping_interval=20, 
         ping_timeout=20
     ):
-        asyncio.create_task(perform_backfill(client, valid_channels_set))
-        await client.run_until_disconnected()
+        # NOW we connect to Telegram (If this takes time, the port is already open)
+        logger.info("Connecting to Telegram...")
+        await client.start()
+        logger.info("✅ Telegram Connected")
 
-if __name__ == '__main__':
-    # --- NUCLEAR LOG SUPPRESSION (Updated for your errors) ---
-    # We explicitly silence the library that is spamming "got HEAD"
-    # This does not fix the bot sending HEAD, but it hides the error.
-    loggers = [
-        "websockets",
-        "websockets.server",
-        "websockets.protocol",
-        "websockets.asyncio.server", 
-        "asyncio"
-    ]
-    for l in loggers:
-        logging.getLogger(l).setLevel(logging.CRITICAL)
+        valid_channels_set = set()
+        all_chat_ids = CHANNELS['public'] + CHANNELS['vip']
         
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+        for chat in all_chat_ids:
+            try:
+                entity = await client.get_entity(chat)
+                clean_id = get_clean_id(entity.id)
+                valid_channels_set.add(clean_id)
+                logger.info(f"   ✅ Verified: {getattr(entity, 'title', chat)} [ID: {clean_id}]")
+            except Exception: pass
+
+        async def process_event(event):
+            if event.sender_id == BOT_ID: return 
+            clean_id = get_clean_id(event.chat_id)
+            if clean_id not in valid_channels_set and not event.is_private: return
+
+            unique_id = f"tg_{clean_id}_{event.id}"
+            if is_deleted(unique_id): return
+
+            parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
+            
+            if parsed:
+                if clean_id in valid_channels_set:
+                     vip_ids = [get_clean_id(x) for x in CHANNELS['vip']]
+                     parsed['type'] = 'VIP' if (clean_id in vip_ids) else 'Public'
+                     chat_obj = await event.get_chat()
+                     parsed['source'] = getattr(chat_obj, 'title', 'Channel')
+                else:
+                     parsed['source'] = 'Saved/Private'
+                     parsed['type'] = 'Manual'
+
+                is_new = save_signal_to_db(parsed)
+                await broadcast_signal(parsed)
+                if is_new: await send_telegram_alert(parsed)
+
+        @client.on(events.NewMessage)
+        async
