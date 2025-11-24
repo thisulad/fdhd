@@ -36,7 +36,7 @@ except (AttributeError, IndexError, ValueError):
     BOT_ID = 0
 
 CHANNELS = {
-    'public': ['Binancesignalwithishara', 'me'], 
+    'public': ['Binancesignalwithishara', ], 
     'vip': [-1002138095358] 
 }
 
@@ -332,3 +332,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
