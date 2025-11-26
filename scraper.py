@@ -6,10 +6,8 @@ import time
 import websockets
 import sys
 import os
-import urllib.request
-import urllib.parse
-import http
 import certifi
+import aiohttp  # NEW: For async HTTP requests
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from pymongo import MongoClient
@@ -20,29 +18,28 @@ API_ID = int(os.environ.get('API_ID', 18384173))
 API_HASH = os.environ.get('API_HASH', 'bb8b0e6fba49bd873f68ac98547ded2b')
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '8215053396:AAHhwbn74Bfzv-tvf7oVHNQwb3K54f-8qyo')
 BOT_CHAT_ID = os.environ.get('BOT_CHAT_ID', '943672693')
-SESSION_STRING = os.environ.get('SESSION_STRING', '') 
-MONGO_URI = os.environ.get('MONGO_URI') 
+SESSION_STRING = os.environ.get('SESSION_STRING', '')
+MONGO_URI = os.environ.get('MONGO_URI')
 PORT = int(os.environ.get("PORT", 8765))
 
-# Global DB Variables
+# Global Variables
 mongo_client = None
 signals_collection = None
 deleted_collection = None
 
-# Safety: Extract Bot ID
 try:
     BOT_ID = int(BOT_TOKEN.split(':')[0])
 except (AttributeError, IndexError, ValueError):
     BOT_ID = 0
 
 CHANNELS = {
-    'public': ['Binancesignalwithishara', ], 
-    'vip': [-1002138095358] 
+    'public': ['Binancesignalwithishara', 'me'],
+    'vip': [-1002138095358]
 }
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
-    format='[%(levelname)s] %(asctime)s: %(message)s', 
+    format='[%(levelname)s] %(asctime)s: %(message)s',
     level=logging.INFO,
     datefmt='%H:%M:%S'
 )
@@ -50,20 +47,29 @@ logger = logging.getLogger(__name__)
 
 connected_clients = set()
 
-# --- CONSTANTS & REGEX ---
+# --- IMPROVED CONSTANTS & REGEX ---
 BLACKLIST_PAIRS = {
-    'CHAT', 'START', 'JOIN', 'PREMIUM', 'VIP', 'ADMIN', 'SIGNAL', 'TODAY', 
-    'RESULTS', 'FEEDBACK', 'RISK', 'REWARD', 'MINUTS', 'MINUTES', 'FREE', 
-    'ZERO', 'CREATOR', 'FXBUN', 'CREATORFXBUN', 'ZONE', 'ENTRY', 'TARGET', 
-    'PROFIT', 'LOSS', 'SPOT', 'FUTURE', 'LEVERAGE', 'MARGIN', 'CROSS', 
-    'ISOLATED', 'SETUP', 'ANALYSIS', 'DISCLAIMER'
+    'CHAT', 'START', 'JOIN', 'PREMIUM', 'VIP', 'ADMIN', 'SIGNAL', 'TODAY',
+    'RESULTS', 'FEEDBACK', 'RISK', 'REWARD', 'MINUTS', 'MINUTES', 'FREE',
+    'ZERO', 'CREATOR', 'FXBUN', 'CREATORFXBUN', 'ZONE', 'ENTRY', 'TARGET',
+    'PROFIT', 'LOSS', 'SPOT', 'FUTURE', 'LEVERAGE', 'MARGIN', 'CROSS',
+    'ISOLATED', 'SETUP', 'ANALYSIS', 'DISCLAIMER', 'ADVERTISEMENT', 'PROMO'
 }
 
 PATTERNS = {
+    # Improved Pair Regex: Catches BTC/USDT, BTCUSDT, #BTC, $BTC
     'pair_strict': r'(?:\#|\$)?([A-Z0-9]{2,8}(?:/[A-Z0-9]{2,8})?)',
+    
+    # Flexible Direction: Catches Long, Buy, Short, Sell
     'direction': r'\b(Long|Short|Buy|Sell)\b',
-    'entry': r'(?:Entry|Buy|EP|Enter)(?:\s*(?:Zone|Range|Price|Target)?)?[\s:-]*([0-9\.,\s\-]+)',
-    'targets': r'(?:Target\s*s?|TP\s*s?|Profit|T\.P)[\s\n:-]*([0-9\.,\s\-/✅]+)',
+    
+    # Robust Entry: Catches "Entry:", "Buy Zone:", "EP:", "Enter at"
+    'entry': r'(?:Entry|Buy|EP|Enter|Price)(?:\s*(?:Zone|Range|Price|Target|at)?)?[\s:-]*([0-9\.,\s\-]+)',
+    
+    # Robust Targets: Catches "TP:", "Targets:", "Profit:", "Take Profit"
+    'targets': r'(?:Target\s*s?|TP\s*s?|Profit|Take\s*Profit|T\.P)[\s\n:-]*([0-9\.,\s\-/✅]+)',
+    
+    # Leverage
     'leverage': r'(?:Lev(?:erage)?\s*|Margin\s*)?[:\s]*((?:Cross|Iso|Isolated)?\s*[0-9]+x?)',
 }
 
@@ -80,8 +86,8 @@ def save_signal_to_db(signal_data):
     try:
         existing = signals_collection.find_one({'id': signal_data['id']})
         signals_collection.update_one(
-            {'id': signal_data['id']}, 
-            {'$set': signal_data}, 
+            {'id': signal_data['id']},
+            {'$set': signal_data},
             upsert=True
         )
         return existing is None
@@ -101,26 +107,34 @@ def delete_signal(signal_id):
     try:
         signals_collection.delete_one({'id': str(signal_id)})
         deleted_collection.update_one(
-            {'id': str(signal_id)}, 
-            {'$set': {'id': str(signal_id), 'deleted_at': time.time()}}, 
+            {'id': str(signal_id)},
+            {'$set': {'id': str(signal_id), 'deleted_at': time.time()}},
             upsert=True
         )
         logger.info(f"🗑️ Deleted signal {signal_id}")
     except PyMongoError: pass
 
+# --- IMPROVED PARSING ENGINE ---
 def parse_signal(text, timestamp=None, custom_id=None):
     if not text: return None
+    # Normalize text: remove bold/italic markdown, trim whitespace
     clean_text = text.replace('**', '').replace('__', '').replace('`', '').strip()
     
+    # 1. Pair Detection
     pair_match = re.search(PATTERNS['pair_strict'], clean_text, re.IGNORECASE)
-    if not pair_match: return None 
+    if not pair_match: return None
     
     raw_pair = pair_match.group(1).upper().replace('/', '')
+    
+    # Blacklist Check
     if raw_pair in BLACKLIST_PAIRS or len(raw_pair) < 3: return None
     
+    # Context Check: Must look like a crypto pair or be near a direction keyword
     is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
     has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
-    if not is_major and not has_direction: return None
+    
+    if not is_major and not has_direction:
+        return None
 
     ts = timestamp if timestamp else time.time()
     sig_id = str(custom_id) if custom_id else str(int(ts * 1000))
@@ -130,25 +144,37 @@ def parse_signal(text, timestamp=None, custom_id=None):
         'timestamp': ts, 'status': 'pending'
     }
 
+    # 2. Direction
     if dir_match := re.search(PATTERNS['direction'], clean_text, re.IGNORECASE):
-        signal['direction'] = dir_match.group(1).capitalize()
-    elif 'buy' in clean_text.lower(): signal['direction'] = 'Long'
-    elif 'sell' in clean_text.lower(): signal['direction'] = 'Short'
-    else: signal['direction'] = 'Unknown'
+        d = dir_match.group(1).capitalize()
+        # Normalize Buy->Long, Sell->Short
+        if d == 'Buy': signal['direction'] = 'Long'
+        elif d == 'Sell': signal['direction'] = 'Short'
+        else: signal['direction'] = d
+    else:
+        # Fallback: Guess based on pair (not recommended, set unknown)
+        signal['direction'] = 'Unknown'
 
+    # 3. Entry
     if entry_match := re.search(PATTERNS['entry'], clean_text, re.IGNORECASE):
         signal['entry'] = entry_match.group(1).strip()
-    else: signal['entry'] = 'Market'
+    else:
+        signal['entry'] = 'Market'
 
+    # 4. Targets (Improved splitting)
     if target_match := re.search(PATTERNS['targets'], clean_text, re.IGNORECASE | re.DOTALL):
         raw_targets = target_match.group(1).replace('\n', ' ')
-        signal['targets'] = [t.strip() for t in re.split(r'\/|,|\s+', raw_targets) if t.strip()]
-    else: signal['targets'] = []
+        # Split by common delimiters
+        signal['targets'] = [t.strip() for t in re.split(r'\/|,|\s\-\s|\s+', raw_targets) if t.strip() and t.strip() not in ['-', 'TP']]
+    else:
+        signal['targets'] = []
 
+    # 5. Leverage
     if lev_match := re.search(PATTERNS['leverage'], clean_text, re.IGNORECASE):
         content = lev_match.group(0)
         signal['leverage'] = content.split(':', 1)[1].strip() if ':' in content else content
-    else: signal['leverage'] = 'Standard'
+    else:
+        signal['leverage'] = 'Standard'
 
     return signal
 
@@ -188,25 +214,37 @@ async def broadcast_signal(signal_data, delete_action=False):
         await asyncio.gather(*[client.send(msg) for client in connected_clients], return_exceptions=True)
     except Exception: pass
 
-def send_via_http(token, chat_id, message):
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-        encoded = urllib.parse.urlencode(data).encode('utf-8')
-        req = urllib.request.Request(url, data=encoded)
-        with urllib.request.urlopen(req) as response: pass
-    except Exception: pass
-
+# --- IMPROVED ASYNC TELEGRAM ALERT ---
 async def send_telegram_alert(signal):
-    if not BOT_TOKEN or not BOT_CHAT_ID: return
+    if not BOT_TOKEN or not BOT_CHAT_ID: 
+        logger.warning("⚠️ Missing BOT_TOKEN or BOT_CHAT_ID. Alert skipped.")
+        return
+
     emoji = "🟢" if signal.get('direction') == 'Long' else "🔴"
     targets_str = "\n".join([f"   🎯 {t}" for t in signal['targets']])
+    
     msg = (f"⚡ **{signal['pair']}** {emoji} **{signal['direction'].upper()}**\n\n"
            f"📥 **Entry:** {signal['entry']}\n"
            f"⚙️ **Lev:** {signal['leverage']}\n\n"
            f"**Targets:**\n{targets_str}\n\n"
            f"🔎 _Source: {signal.get('source', 'Unknown')}_")
-    await asyncio.to_thread(send_via_http, BOT_TOKEN, BOT_CHAT_ID, msg)
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": BOT_CHAT_ID,
+        "text": msg,
+        "parse_mode": "Markdown"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as response:
+                if response.status == 200:
+                    logger.info(f"✅ Alert Sent: {signal['pair']}")
+                else:
+                    logger.error(f"❌ Alert Failed: {await response.text()}")
+    except Exception as e:
+        logger.error(f"❌ Alert Exception: {e}")
 
 async def websocket_handler(websocket):
     logger.info("✅ Dashboard Connected")
@@ -244,7 +282,6 @@ async def websocket_handler(websocket):
 async def main():
     global mongo_client, signals_collection, deleted_collection
     
-    # 1. START SERVER INSTANTLY (NO HEALTH CHECK ARGUMENT)
     logger.info(f"🚀 Starting Server on port {PORT}...")
     server = await websockets.serve(
         websocket_handler, 
@@ -254,7 +291,6 @@ async def main():
         ping_timeout=20
     )
 
-    # 2. START BACKGROUND TASKS
     async def bootstrap_app():
         global mongo_client, signals_collection, deleted_collection
         
@@ -291,7 +327,9 @@ async def main():
                 if clean_id not in valid_channels_set and not event.is_private: return
                 unique_id = f"tg_{clean_id}_{event.id}"
                 if is_deleted(unique_id): return
+                
                 parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
+                
                 if parsed:
                     if clean_id in valid_channels_set:
                         vip_ids = [get_clean_id(x) for x in CHANNELS['vip']]
@@ -300,9 +338,14 @@ async def main():
                         parsed['source'] = getattr(chat_obj, 'title', 'Channel')
                     else:
                         parsed['source'] = 'Saved/Private'; parsed['type'] = 'Manual'
+                    
                     is_new = save_signal_to_db(parsed)
                     await broadcast_signal(parsed)
-                    if is_new: await send_telegram_alert(parsed)
+                    
+                    # --- CRITICAL: Send Alert if New ---
+                    if is_new: 
+                        logger.info(f"🔔 New Signal Found: {parsed['pair']}")
+                        await send_telegram_alert(parsed)
 
             client.add_event_handler(process_event, events.NewMessage)
             client.add_event_handler(process_event, events.MessageEdited)
@@ -332,4 +375,3 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-
