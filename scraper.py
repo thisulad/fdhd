@@ -23,12 +23,14 @@ SESSION_STRING = os.environ.get('SESSION_STRING', '')
 MONGO_URI = os.environ.get('MONGO_URI')
 PORT = int(os.environ.get("PORT", 8765))
 
-# --- GLOBAL STATE ---
+# --- GLOBAL STATE & METRICS ---
 START_TIME = time.time()
 SCRAPER_PAUSED = False
 MSGS_SCANNED = 0
-SIGNALS_SENT = 0          # NEW: Track total signals sent
-LAST_SIGNAL_TIME = None   # NEW: Track time of last signal
+SIGNALS_SENT = 0
+LAST_SIGNAL_TIME = None
+
+# DB Placeholders
 mongo_client = None
 signals_collection = None
 deleted_collection = None
@@ -40,12 +42,14 @@ except (AttributeError, IndexError, ValueError):
     BOT_ID = 0
     ADMIN_ID = 0
 
+# --- UPDATED CHANNELS LIST ---
 CHANNELS = {
     'public': ['Binancesignalwithishara', 'me'],
-    'vip': [-1002138095358]
+    # Added your new private channel ID here
+    'vip': [-1002138095358, -1001905653511]
 }
 
-# --- LOGGING SETUP ---
+# --- LOGGING ---
 logging.basicConfig(
     format='[%(levelname)s] %(asctime)s: %(message)s',
     level=logging.INFO,
@@ -67,19 +71,29 @@ BLACKLIST_PAIRS = {
 PATTERNS = {
     'pair_strict': r'(?:\#|\$)?([A-Z0-9]{2,8}(?:/[A-Z0-9]{2,8})?)',
     'direction': r'\b(Long|Short|Buy|Sell)\b',
-    'entry': r'(?:Entry|Buy|EP|Enter|Price)(?:\s*(?:Zone|Range|Price|Target|at)?)?[\s:-]*([0-9\.,\s\-]+)',
-    'targets': r'(?:Target\s*s?|TP\s*s?|Profit|Take\s*Profit|T\.P)[\s\n:-]*([0-9\.,\s\-/✅]+)',
-    'leverage': r'(?:Lev(?:erage)?\s*|Margin\s*)?[:\s]*((?:Cross|Iso|Isolated)?\s*[0-9]+x?)',
+    
+    # UPDATED ENTRY: Catches "Above", "Below", "At" and handles "-" separator
+    'entry': r'(?:Entry|Buy|EP|Enter|Price|Above|Below|At)(?:\s*(?:Zone|Range|Price|Target|at|\-)?)?[\s:-]*([0-9\.,\s\-]+)',
+    
+    # UPDATED TARGETS: Catches "TP-wait" or standard numbers
+    'targets': r'(?:Target\s*s?|TP\s*s?|Profit|Take\s*Profit|T\.P)[\s\n:-]*(wait|[0-9\.,\s\-/✅]+)',
+    
+    # UPDATED LEVERAGE: Handles "10X or X5" formats
+    'leverage': r'(?:Lev(?:erage)?\s*|Margin\s*)?[:\s\-]*(?:Cross|Iso|Isolated)?\s*([0-9]+[xX](?:\s*or\s*[xX]?[0-9]+[xX]?)?)',
+    
+    # NEW STOP LOSS PATTERN: Catches "SL-" or "Stop Loss"
+    'stop_loss': r'(?:SL|Stop\s*Loss)[\s:-]*([0-9\.]+)'
 }
 
 # --- HELPER FUNCTIONS ---
 
-def format_time_ago(timestamp):
-    if not timestamp: return "N/A"
-    seconds = int(time.time() - timestamp)
-    if seconds < 60: return f"{seconds}s ago"
-    if seconds < 3600: return f"{seconds // 60}m {seconds % 60}s ago"
-    return f"{seconds // 3600}h {(seconds % 3600) // 60}m ago"
+def format_uptime(seconds):
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    d, h = divmod(h, 24)
+    if d > 0: return f"{int(d)}d {int(h)}h {int(m)}m"
+    if h > 0: return f"{int(h)}h {int(m)}m"
+    return f"{int(m)}m {int(s)}s"
 
 def is_deleted(signal_id):
     if deleted_collection is None: return False
@@ -123,8 +137,10 @@ def delete_signal(signal_id):
 # --- PARSING ENGINE ---
 def parse_signal(text, timestamp=None, custom_id=None):
     if not text: return None
+    # Normalize text: remove bold/italic markdown, trim whitespace
     clean_text = text.replace('**', '').replace('__', '').replace('`', '').strip()
     
+    # 1. Pair Detection
     pair_match = re.search(PATTERNS['pair_strict'], clean_text, re.IGNORECASE)
     if not pair_match: return None
     
@@ -132,6 +148,7 @@ def parse_signal(text, timestamp=None, custom_id=None):
     
     if raw_pair in BLACKLIST_PAIRS or len(raw_pair) < 3: return None
     
+    # Context Check: Must look like a crypto pair or be near a direction keyword
     is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
     has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
     
@@ -146,6 +163,7 @@ def parse_signal(text, timestamp=None, custom_id=None):
         'timestamp': ts, 'status': 'pending'
     }
 
+    # 2. Direction
     if dir_match := re.search(PATTERNS['direction'], clean_text, re.IGNORECASE):
         d = dir_match.group(1).capitalize()
         if d == 'Buy': signal['direction'] = 'Long'
@@ -154,22 +172,35 @@ def parse_signal(text, timestamp=None, custom_id=None):
     else:
         signal['direction'] = 'Unknown'
 
+    # 3. Entry (Handles "Above - 0.1424")
     if entry_match := re.search(PATTERNS['entry'], clean_text, re.IGNORECASE):
-        signal['entry'] = entry_match.group(1).strip()
+        # Clean up the extracted entry (remove leading dashes or spaces)
+        raw_entry = entry_match.group(1).strip().lstrip('-').strip()
+        signal['entry'] = raw_entry
     else:
         signal['entry'] = 'Market'
 
+    # 4. Targets (Handles "TP-wait")
     if target_match := re.search(PATTERNS['targets'], clean_text, re.IGNORECASE | re.DOTALL):
         raw_targets = target_match.group(1).replace('\n', ' ')
-        signal['targets'] = [t.strip() for t in re.split(r'\/|,|\s\-\s|\s+', raw_targets) if t.strip() and t.strip() not in ['-', 'TP']]
+        if 'wait' in raw_targets.lower():
+            signal['targets'] = ['Wait']
+        else:
+            # Split by common delimiters
+            signal['targets'] = [t.strip() for t in re.split(r'\/|,|\s\-\s|\s+', raw_targets) if t.strip() and t.strip() not in ['-', 'TP']]
     else:
         signal['targets'] = []
 
+    # 5. Leverage (Handles "10X or X5")
     if lev_match := re.search(PATTERNS['leverage'], clean_text, re.IGNORECASE):
-        content = lev_match.group(0)
-        signal['leverage'] = content.split(':', 1)[1].strip() if ':' in content else content
+        content = lev_match.group(1) # Capture the group with the values
+        signal['leverage'] = content.strip()
     else:
         signal['leverage'] = 'Standard'
+        
+    # 6. Stop Loss (Optional extraction for DB)
+    if sl_match := re.search(PATTERNS['stop_loss'], clean_text, re.IGNORECASE):
+        signal['stop_loss'] = sl_match.group(1).strip()
 
     return signal
 
@@ -210,14 +241,23 @@ async def broadcast_signal(signal_data, delete_action=False):
     except Exception: pass
 
 async def send_telegram_alert(signal):
-    if not BOT_TOKEN or not BOT_CHAT_ID: return
+    if not BOT_TOKEN or not BOT_CHAT_ID: 
+        return
 
     emoji = "🟢" if signal.get('direction') == 'Long' else "🔴"
-    targets_str = "\n".join([f"   🎯 {t}" for t in signal['targets']])
+    
+    # Handle "Wait" target gracefully
+    if 'Wait' in signal['targets']:
+        targets_str = "   ⏳ TP: Wait for update"
+    else:
+        targets_str = "\n".join([f"   🎯 {t}" for t in signal['targets']])
+        
+    sl_str = f"\n🛑 **SL:** {signal.get('stop_loss', 'N/A')}" if signal.get('stop_loss') else ""
     
     msg = (f"⚡ **{signal['pair']}** {emoji} **{signal['direction'].upper()}**\n\n"
            f"📥 **Entry:** {signal['entry']}\n"
-           f"⚙️ **Lev:** {signal['leverage']}\n\n"
+           f"⚙️ **Lev:** {signal['leverage']}"
+           f"{sl_str}\n\n"
            f"**Targets:**\n{targets_str}\n\n"
            f"🔎 _Source: {signal.get('source', 'Unknown')}_")
 
@@ -226,7 +266,9 @@ async def send_telegram_alert(signal):
 
     try:
         async with aiohttp.ClientSession() as session:
-            await session.post(url, json=payload)
+            async with session.post(url, json=payload) as response:
+                if response.status != 200:
+                    logger.error(f"❌ Alert Failed: {await response.text()}")
     except Exception as e:
         logger.error(f"❌ Alert Exception: {e}")
 
@@ -305,10 +347,11 @@ async def main():
                     valid_channels_set.add(get_clean_id(entity.id))
                 except: pass
 
+            # --- SIGNAL HANDLER ---
             async def process_event(event):
                 global MSGS_SCANNED, SIGNALS_SENT, LAST_SIGNAL_TIME
-                
                 if event.sender_id == BOT_ID: return 
+                
                 if SCRAPER_PAUSED and not event.is_private: return
 
                 clean_id = get_clean_id(event.chat_id)
@@ -330,42 +373,44 @@ async def main():
                     
                     is_new = save_signal_to_db(parsed)
                     await broadcast_signal(parsed)
-                    
                     if is_new: 
                         SIGNALS_SENT += 1
                         LAST_SIGNAL_TIME = time.time()
                         logger.info(f"🔔 New Signal: {parsed['pair']}")
                         await send_telegram_alert(parsed)
 
-            # --- UPDATED ADMIN COMMANDS ---
+            # --- ADMIN COMMAND HANDLER ---
             @client.on(events.NewMessage(pattern='/'))
             async def admin_handler(event):
-                global SCRAPER_PAUSED
+                global SCRAPER_PAUSED, MSGS_SCANNED, SIGNALS_SENT, LAST_SIGNAL_TIME
+                
                 if event.sender_id != ADMIN_ID: return
 
                 cmd = event.text.split()[0].lower()
                 
                 if cmd == '/status':
-                    # Calculate uptime
-                    uptime_sec = int(time.time() - START_TIME)
-                    h = uptime_sec // 3600
-                    m = (uptime_sec % 3600) // 60
+                    uptime = format_uptime(time.time() - START_TIME)
                     
-                    state_icon = "🔴 Paused" if SCRAPER_PAUSED else "🟢 Running"
-                    db_icon = "✅ Connected" if mongo_client else "❌ Error"
-                    tg_icon = "✅ Connected" if client.is_connected() else "❌ Error"
-                    last_sig = format_time_ago(LAST_SIGNAL_TIME)
+                    if LAST_SIGNAL_TIME:
+                        ago = format_uptime(time.time() - LAST_SIGNAL_TIME)
+                        last_sig_str = f"{ago} ago"
+                    else:
+                        last_sig_str = "No signals yet"
+
+                    status_emoji = "🔴 PAUSED" if SCRAPER_PAUSED else "🟢 Running"
+                    db_emoji = "✅ Connected" if mongo_client else "❌ Error"
+                    tg_emoji = "✅ Connected" if client.is_connected() else "❌ Error"
 
                     msg = (
                         f"📊 **Bot Status**\n\n"
-                        f"**Status:** {state_icon}\n"
-                        f"**Uptime:** {h}h {m}m\n"
+                        f"**Status:** {status_emoji}\n"
+                        f"**Uptime:** {uptime}\n"
                         f"**Messages Scanned:** {MSGS_SCANNED}\n"
                         f"**Signals Sent:** {SIGNALS_SENT}\n"
                         f"**Dashboard Clients:** {len(connected_clients)}\n"
-                        f"**Database:** {db_icon}\n"
-                        f"**Telegram:** {tg_icon}\n"
-                        f"**Last Signal:** {last_sig}"
+                        f"**Database:** {db_emoji}\n"
+                        f"**Telegram:** {tg_emoji}\n"
+                        f"**Last Signal:** {last_sig_str}"
                     )
                     await event.respond(msg)
                 
@@ -377,17 +422,12 @@ async def main():
                     SCRAPER_PAUSED = False
                     await event.respond("▶️ **Scraper RESUMED.**")
                     
-                elif cmd == '/help':
-                    await event.respond("🛠 **Commands:** `/status`, `/pause`, `/resume`, `/add pair dir price`")
-
-                # Manual Add: /add BTC Long 95000
                 elif cmd == '/add':
                     try:
                         parts = event.text.split()
                         if len(parts) < 4:
                             await event.respond("⚠️ Usage: `/add BTC Long 95000`")
                             return
-                        
                         payload = {
                             'id': f"man_{int(time.time()*1000)}",
                             'pair': parts[1].upper(),
@@ -395,14 +435,14 @@ async def main():
                             'entry': parts[3],
                             'targets': ['Open'],
                             'leverage': 'Manual',
-                            'source': 'Telegram Admin',
+                            'source': 'Admin',
                             'type': 'Manual',
                             'timestamp': time.time(),
                             'status': 'pending'
                         }
                         save_signal_to_db(payload)
                         await broadcast_signal(payload)
-                        await event.respond(f"✅ **Added:** {payload['pair']} {payload['direction']}")
+                        await event.respond(f"✅ **Added:** {payload['pair']}")
                     except Exception as e:
                         await event.respond(f"❌ Error: {str(e)}")
 
