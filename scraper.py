@@ -7,7 +7,8 @@ import websockets
 import sys
 import os
 import certifi
-import aiohttp  # NEW: For async HTTP requests
+import aiohttp
+from datetime import datetime, timedelta
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from pymongo import MongoClient
@@ -22,15 +23,20 @@ SESSION_STRING = os.environ.get('SESSION_STRING', '')
 MONGO_URI = os.environ.get('MONGO_URI')
 PORT = int(os.environ.get("PORT", 8765))
 
-# Global Variables
+# --- GLOBAL STATE ---
+START_TIME = time.time()
+SCRAPER_PAUSED = False
+MSGS_SCANNED = 0
 mongo_client = None
 signals_collection = None
 deleted_collection = None
 
 try:
     BOT_ID = int(BOT_TOKEN.split(':')[0])
+    ADMIN_ID = int(BOT_CHAT_ID) # Only allow commands from this ID
 except (AttributeError, IndexError, ValueError):
     BOT_ID = 0
+    ADMIN_ID = 0
 
 CHANNELS = {
     'public': ['Binancesignalwithishara', 'me'],
@@ -47,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 connected_clients = set()
 
-# --- IMPROVED CONSTANTS & REGEX ---
+# --- CONSTANTS & REGEX ---
 BLACKLIST_PAIRS = {
     'CHAT', 'START', 'JOIN', 'PREMIUM', 'VIP', 'ADMIN', 'SIGNAL', 'TODAY',
     'RESULTS', 'FEEDBACK', 'RISK', 'REWARD', 'MINUTS', 'MINUTES', 'FREE',
@@ -57,19 +63,10 @@ BLACKLIST_PAIRS = {
 }
 
 PATTERNS = {
-    # Improved Pair Regex: Catches BTC/USDT, BTCUSDT, #BTC, $BTC
     'pair_strict': r'(?:\#|\$)?([A-Z0-9]{2,8}(?:/[A-Z0-9]{2,8})?)',
-    
-    # Flexible Direction: Catches Long, Buy, Short, Sell
     'direction': r'\b(Long|Short|Buy|Sell)\b',
-    
-    # Robust Entry: Catches "Entry:", "Buy Zone:", "EP:", "Enter at"
     'entry': r'(?:Entry|Buy|EP|Enter|Price)(?:\s*(?:Zone|Range|Price|Target|at)?)?[\s:-]*([0-9\.,\s\-]+)',
-    
-    # Robust Targets: Catches "TP:", "Targets:", "Profit:", "Take Profit"
     'targets': r'(?:Target\s*s?|TP\s*s?|Profit|Take\s*Profit|T\.P)[\s\n:-]*([0-9\.,\s\-/✅]+)',
-    
-    # Leverage
     'leverage': r'(?:Lev(?:erage)?\s*|Margin\s*)?[:\s]*((?:Cross|Iso|Isolated)?\s*[0-9]+x?)',
 }
 
@@ -114,22 +111,18 @@ def delete_signal(signal_id):
         logger.info(f"🗑️ Deleted signal {signal_id}")
     except PyMongoError: pass
 
-# --- IMPROVED PARSING ENGINE ---
+# --- PARSING ENGINE ---
 def parse_signal(text, timestamp=None, custom_id=None):
     if not text: return None
-    # Normalize text: remove bold/italic markdown, trim whitespace
     clean_text = text.replace('**', '').replace('__', '').replace('`', '').strip()
     
-    # 1. Pair Detection
     pair_match = re.search(PATTERNS['pair_strict'], clean_text, re.IGNORECASE)
     if not pair_match: return None
     
     raw_pair = pair_match.group(1).upper().replace('/', '')
     
-    # Blacklist Check
     if raw_pair in BLACKLIST_PAIRS or len(raw_pair) < 3: return None
     
-    # Context Check: Must look like a crypto pair or be near a direction keyword
     is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
     has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
     
@@ -144,32 +137,25 @@ def parse_signal(text, timestamp=None, custom_id=None):
         'timestamp': ts, 'status': 'pending'
     }
 
-    # 2. Direction
     if dir_match := re.search(PATTERNS['direction'], clean_text, re.IGNORECASE):
         d = dir_match.group(1).capitalize()
-        # Normalize Buy->Long, Sell->Short
         if d == 'Buy': signal['direction'] = 'Long'
         elif d == 'Sell': signal['direction'] = 'Short'
         else: signal['direction'] = d
     else:
-        # Fallback: Guess based on pair (not recommended, set unknown)
         signal['direction'] = 'Unknown'
 
-    # 3. Entry
     if entry_match := re.search(PATTERNS['entry'], clean_text, re.IGNORECASE):
         signal['entry'] = entry_match.group(1).strip()
     else:
         signal['entry'] = 'Market'
 
-    # 4. Targets (Improved splitting)
     if target_match := re.search(PATTERNS['targets'], clean_text, re.IGNORECASE | re.DOTALL):
         raw_targets = target_match.group(1).replace('\n', ' ')
-        # Split by common delimiters
         signal['targets'] = [t.strip() for t in re.split(r'\/|,|\s\-\s|\s+', raw_targets) if t.strip() and t.strip() not in ['-', 'TP']]
     else:
         signal['targets'] = []
 
-    # 5. Leverage
     if lev_match := re.search(PATTERNS['leverage'], clean_text, re.IGNORECASE):
         content = lev_match.group(0)
         signal['leverage'] = content.split(':', 1)[1].strip() if ':' in content else content
@@ -214,7 +200,6 @@ async def broadcast_signal(signal_data, delete_action=False):
         await asyncio.gather(*[client.send(msg) for client in connected_clients], return_exceptions=True)
     except Exception: pass
 
-# --- IMPROVED ASYNC TELEGRAM ALERT ---
 async def send_telegram_alert(signal):
     if not BOT_TOKEN or not BOT_CHAT_ID: 
         logger.warning("⚠️ Missing BOT_TOKEN or BOT_CHAT_ID. Alert skipped.")
@@ -230,18 +215,12 @@ async def send_telegram_alert(signal):
            f"🔎 _Source: {signal.get('source', 'Unknown')}_")
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": BOT_CHAT_ID,
-        "text": msg,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": BOT_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload) as response:
-                if response.status == 200:
-                    logger.info(f"✅ Alert Sent: {signal['pair']}")
-                else:
+                if response.status != 200:
                     logger.error(f"❌ Alert Failed: {await response.text()}")
     except Exception as e:
         logger.error(f"❌ Alert Exception: {e}")
@@ -321,15 +300,22 @@ async def main():
                     valid_channels_set.add(get_clean_id(entity.id))
                 except: pass
 
+            # --- SIGNAL HANDLER ---
             async def process_event(event):
+                global MSGS_SCANNED
                 if event.sender_id == BOT_ID: return 
+                
+                # Ignore processing if Paused (unless it's your Saved Messages)
+                if SCRAPER_PAUSED and not event.is_private: return
+
                 clean_id = get_clean_id(event.chat_id)
                 if clean_id not in valid_channels_set and not event.is_private: return
+                
+                MSGS_SCANNED += 1
                 unique_id = f"tg_{clean_id}_{event.id}"
                 if is_deleted(unique_id): return
                 
                 parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
-                
                 if parsed:
                     if clean_id in valid_channels_set:
                         vip_ids = [get_clean_id(x) for x in CHANNELS['vip']]
@@ -341,11 +327,78 @@ async def main():
                     
                     is_new = save_signal_to_db(parsed)
                     await broadcast_signal(parsed)
-                    
-                    # --- CRITICAL: Send Alert if New ---
                     if is_new: 
-                        logger.info(f"🔔 New Signal Found: {parsed['pair']}")
+                        logger.info(f"🔔 New Signal: {parsed['pair']}")
                         await send_telegram_alert(parsed)
+
+            # --- ADMIN COMMAND HANDLER ---
+            @client.on(events.NewMessage(pattern='/'))
+            async def admin_handler(event):
+                global SCRAPER_PAUSED
+                
+                # Security Check: Only accept commands from ADMIN_ID
+                if event.sender_id != ADMIN_ID: return
+
+                cmd = event.text.split()[0].lower()
+                
+                if cmd == '/status':
+                    uptime = str(timedelta(seconds=int(time.time() - START_TIME)))
+                    status_emoji = "🔴 PAUSED" if SCRAPER_PAUSED else "🟢 ACTIVE"
+                    db_status = "✅ Connected" if mongo_client else "❌ Disconnected"
+                    msg = (
+                        f"🤖 **System Status**\n\n"
+                        f"📡 **State:** {status_emoji}\n"
+                        f"⏱ **Uptime:** {uptime}\n"
+                        f"📨 **Scanned:** {MSGS_SCANNED} msgs\n"
+                        f"💾 **Database:** {db_status}\n"
+                        f"🌐 **Clients:** {len(connected_clients)}"
+                    )
+                    await event.respond(msg)
+                
+                elif cmd == '/pause':
+                    SCRAPER_PAUSED = True
+                    await event.respond("⏸ **Scraper PAUSED.** No new channel signals will be processed.")
+                    
+                elif cmd == '/resume':
+                    SCRAPER_PAUSED = False
+                    await event.respond("▶️ **Scraper RESUMED.** Listening for signals...")
+                    
+                elif cmd == '/help':
+                    msg = (
+                        "🛠 **Admin Commands**\n\n"
+                        "`/status` - View system health & stats\n"
+                        "`/pause` - Stop processing incoming signals\n"
+                        "`/resume` - Resume processing\n"
+                        "`/add BTC Long 95000` - Add manual signal"
+                    )
+                    await event.respond(msg)
+
+                # Manual Add: /add BTC Long 95000
+                elif cmd == '/add':
+                    try:
+                        parts = event.text.split()
+                        # Expected: /add PAIR DIR PRICE
+                        if len(parts) < 4:
+                            await event.respond("⚠️ Usage: `/add BTC Long 95000`")
+                            return
+                        
+                        payload = {
+                            'id': f"man_{int(time.time()*1000)}",
+                            'pair': parts[1].upper(),
+                            'direction': parts[2].capitalize(),
+                            'entry': parts[3],
+                            'targets': ['Open'],
+                            'leverage': 'Manual',
+                            'source': 'Telegram Admin',
+                            'type': 'Manual',
+                            'timestamp': time.time(),
+                            'status': 'pending'
+                        }
+                        save_signal_to_db(payload)
+                        await broadcast_signal(payload)
+                        await event.respond(f"✅ **Added:** {payload['pair']} {payload['direction']}")
+                    except Exception as e:
+                        await event.respond(f"❌ Error: {str(e)}")
 
             client.add_event_handler(process_event, events.NewMessage)
             client.add_event_handler(process_event, events.MessageEdited)
