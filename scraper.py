@@ -27,13 +27,15 @@ PORT = int(os.environ.get("PORT", 8765))
 START_TIME = time.time()
 SCRAPER_PAUSED = False
 MSGS_SCANNED = 0
+SIGNALS_SENT = 0          # NEW: Track total signals sent
+LAST_SIGNAL_TIME = None   # NEW: Track time of last signal
 mongo_client = None
 signals_collection = None
 deleted_collection = None
 
 try:
     BOT_ID = int(BOT_TOKEN.split(':')[0])
-    ADMIN_ID = int(BOT_CHAT_ID) # Only allow commands from this ID
+    ADMIN_ID = int(BOT_CHAT_ID)
 except (AttributeError, IndexError, ValueError):
     BOT_ID = 0
     ADMIN_ID = 0
@@ -71,6 +73,13 @@ PATTERNS = {
 }
 
 # --- HELPER FUNCTIONS ---
+
+def format_time_ago(timestamp):
+    if not timestamp: return "N/A"
+    seconds = int(time.time() - timestamp)
+    if seconds < 60: return f"{seconds}s ago"
+    if seconds < 3600: return f"{seconds // 60}m {seconds % 60}s ago"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60}m ago"
 
 def is_deleted(signal_id):
     if deleted_collection is None: return False
@@ -201,9 +210,7 @@ async def broadcast_signal(signal_data, delete_action=False):
     except Exception: pass
 
 async def send_telegram_alert(signal):
-    if not BOT_TOKEN or not BOT_CHAT_ID: 
-        logger.warning("⚠️ Missing BOT_TOKEN or BOT_CHAT_ID. Alert skipped.")
-        return
+    if not BOT_TOKEN or not BOT_CHAT_ID: return
 
     emoji = "🟢" if signal.get('direction') == 'Long' else "🔴"
     targets_str = "\n".join([f"   🎯 {t}" for t in signal['targets']])
@@ -219,9 +226,7 @@ async def send_telegram_alert(signal):
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as response:
-                if response.status != 200:
-                    logger.error(f"❌ Alert Failed: {await response.text()}")
+            await session.post(url, json=payload)
     except Exception as e:
         logger.error(f"❌ Alert Exception: {e}")
 
@@ -300,12 +305,10 @@ async def main():
                     valid_channels_set.add(get_clean_id(entity.id))
                 except: pass
 
-            # --- SIGNAL HANDLER ---
             async def process_event(event):
-                global MSGS_SCANNED
-                if event.sender_id == BOT_ID: return 
+                global MSGS_SCANNED, SIGNALS_SENT, LAST_SIGNAL_TIME
                 
-                # Ignore processing if Paused (unless it's your Saved Messages)
+                if event.sender_id == BOT_ID: return 
                 if SCRAPER_PAUSED and not event.is_private: return
 
                 clean_id = get_clean_id(event.chat_id)
@@ -327,57 +330,60 @@ async def main():
                     
                     is_new = save_signal_to_db(parsed)
                     await broadcast_signal(parsed)
+                    
                     if is_new: 
+                        SIGNALS_SENT += 1
+                        LAST_SIGNAL_TIME = time.time()
                         logger.info(f"🔔 New Signal: {parsed['pair']}")
                         await send_telegram_alert(parsed)
 
-            # --- ADMIN COMMAND HANDLER ---
+            # --- UPDATED ADMIN COMMANDS ---
             @client.on(events.NewMessage(pattern='/'))
             async def admin_handler(event):
                 global SCRAPER_PAUSED
-                
-                # Security Check: Only accept commands from ADMIN_ID
                 if event.sender_id != ADMIN_ID: return
 
                 cmd = event.text.split()[0].lower()
                 
                 if cmd == '/status':
-                    uptime = str(timedelta(seconds=int(time.time() - START_TIME)))
-                    status_emoji = "🔴 PAUSED" if SCRAPER_PAUSED else "🟢 ACTIVE"
-                    db_status = "✅ Connected" if mongo_client else "❌ Disconnected"
+                    # Calculate uptime
+                    uptime_sec = int(time.time() - START_TIME)
+                    h = uptime_sec // 3600
+                    m = (uptime_sec % 3600) // 60
+                    
+                    state_icon = "🔴 Paused" if SCRAPER_PAUSED else "🟢 Running"
+                    db_icon = "✅ Connected" if mongo_client else "❌ Error"
+                    tg_icon = "✅ Connected" if client.is_connected() else "❌ Error"
+                    last_sig = format_time_ago(LAST_SIGNAL_TIME)
+
                     msg = (
-                        f"🤖 **System Status**\n\n"
-                        f"📡 **State:** {status_emoji}\n"
-                        f"⏱ **Uptime:** {uptime}\n"
-                        f"📨 **Scanned:** {MSGS_SCANNED} msgs\n"
-                        f"💾 **Database:** {db_status}\n"
-                        f"🌐 **Clients:** {len(connected_clients)}"
+                        f"📊 **Bot Status**\n\n"
+                        f"**Status:** {state_icon}\n"
+                        f"**Uptime:** {h}h {m}m\n"
+                        f"**Messages Scanned:** {MSGS_SCANNED}\n"
+                        f"**Signals Sent:** {SIGNALS_SENT}\n"
+                        f"**Dashboard Clients:** {len(connected_clients)}\n"
+                        f"**Database:** {db_icon}\n"
+                        f"**Telegram:** {tg_icon}\n"
+                        f"**Last Signal:** {last_sig}"
                     )
                     await event.respond(msg)
                 
                 elif cmd == '/pause':
                     SCRAPER_PAUSED = True
-                    await event.respond("⏸ **Scraper PAUSED.** No new channel signals will be processed.")
+                    await event.respond("⏸ **Scraper PAUSED.**")
                     
                 elif cmd == '/resume':
                     SCRAPER_PAUSED = False
-                    await event.respond("▶️ **Scraper RESUMED.** Listening for signals...")
+                    await event.respond("▶️ **Scraper RESUMED.**")
                     
                 elif cmd == '/help':
-                    msg = (
-                        "🛠 **Admin Commands**\n\n"
-                        "`/status` - View system health & stats\n"
-                        "`/pause` - Stop processing incoming signals\n"
-                        "`/resume` - Resume processing\n"
-                        "`/add BTC Long 95000` - Add manual signal"
-                    )
-                    await event.respond(msg)
+                    await event.respond("🛠 **Commands:** `/status`, `/pause`, `/resume`, `/add pair dir price`")
 
                 # Manual Add: /add BTC Long 95000
                 elif cmd == '/add':
                     try:
                         parts = event.text.split()
-                        # Expected: /add PAIR DIR PRICE
                         if len(parts) < 4:
                             await event.respond("⚠️ Usage: `/add BTC Long 95000`")
                             return
