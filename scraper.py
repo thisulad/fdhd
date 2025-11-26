@@ -8,7 +8,7 @@ import sys
 import os
 import certifi
 import aiohttp
-import unicodedata  # NEW: To fix fancy fonts (𝑳𝒐𝒏𝒈 -> Long)
+import unicodedata
 from datetime import datetime, timedelta
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -43,11 +43,10 @@ except (AttributeError, IndexError, ValueError):
     BOT_ID = 0
     ADMIN_ID = 0
 
-# --- UPDATED CHANNELS ---
+# --- CHANNELS ---
 CHANNELS = {
     'public': ['Binancesignalwithishara', 'me'],
-    # Added new private channel ID
-    'vip': [-1002138095358, -1001905653511] 
+    'vip': [-1002138095358, -1001905653511]
 }
 
 # --- LOGGING ---
@@ -71,21 +70,10 @@ BLACKLIST_PAIRS = {
 
 PATTERNS = {
     'pair_strict': r'(?:\#|\$)?([A-Z0-9]{2,8}(?:/[A-Z0-9]{2,8})?)',
-    
-    # UPDATED DIRECTION: Added "Buy Long" and "Sell Short" context
     'direction': r'\b(Long|Short|Buy|Sell)\b',
-    
-    # UPDATED ENTRY: Catches "Above", "Below", "At", "Buy Long Above"
-    # This regex skips over words like "Long" or "Short" to find the number
     'entry': r'(?:Entry|Buy|Sell|Short|Long|EP|Enter|Price|Above|Below|At)(?:\s*(?:Long|Short|Zone|Range|Price|Target|at|Above|Below|\-)?)?[\s:-]*([0-9\.,\s\-]+)',
-    
-    # UPDATED TARGETS: Catches "wating" typo, "wait", "Target 1"
     'targets': r'(?:Target\s*s?|TP\s*s?|Profit|Take\s*Profit|T\.P)[\s\n:-]*(wait|wating|[0-9\.,\s\-/✅]+)',
-    
-    # LEVERAGE: Handles "10X", "10x", "Cross"
     'leverage': r'(?:Lev(?:erage)?\s*|Margin\s*)?[:\s\-]*(?:Cross|Iso|Isolated)?\s*([0-9]+[xX](?:\s*or\s*[xX]?[0-9]+[xX]?)?)',
-    
-    # NEW STOP LOSS: Captures SL value or "wating"
     'stop_loss': r'(?:SL|Stop\s*Loss)[\s:-]*(wait|wating|[0-9\.]+)'
 }
 
@@ -138,18 +126,14 @@ def delete_signal(signal_id):
         logger.info(f"🗑️ Deleted signal {signal_id}")
     except PyMongoError: pass
 
-# --- PARSING ENGINE (WITH UNICODE FIX) ---
+# --- PARSING ENGINE ---
 def parse_signal(text, timestamp=None, custom_id=None):
     if not text: return None
     
-    # 1. NORMALIZE FANCY FONTS (The Critical Fix)
-    # Converts "𝑳𝒐𝒏𝒈" -> "Long", "𝑼𝑺𝑫𝑻" -> "USDT"
+    # NORMALIZE FANCY FONTS
     normalized_text = unicodedata.normalize('NFKC', text)
-    
-    # 2. Clean Markdown
     clean_text = normalized_text.replace('**', '').replace('__', '').replace('`', '').strip()
     
-    # 3. Pair Detection
     pair_match = re.search(PATTERNS['pair_strict'], clean_text, re.IGNORECASE)
     if not pair_match: return None
     
@@ -168,7 +152,6 @@ def parse_signal(text, timestamp=None, custom_id=None):
         'timestamp': ts, 'status': 'pending'
     }
 
-    # 4. Direction
     if dir_match := re.search(PATTERNS['direction'], clean_text, re.IGNORECASE):
         d = dir_match.group(1).capitalize()
         if d == 'Buy': signal['direction'] = 'Long'
@@ -177,15 +160,12 @@ def parse_signal(text, timestamp=None, custom_id=None):
     else:
         signal['direction'] = 'Unknown'
 
-    # 5. Entry (Handling "Above -")
     if entry_match := re.search(PATTERNS['entry'], clean_text, re.IGNORECASE):
-        # Remove "Above", "-", "Long" leftovers
         raw_entry = entry_match.group(1).strip().lstrip('-').strip()
         signal['entry'] = raw_entry
     else:
         signal['entry'] = 'Market'
 
-    # 6. Targets (Handling "wating")
     if target_match := re.search(PATTERNS['targets'], clean_text, re.IGNORECASE | re.DOTALL):
         raw_targets = target_match.group(1).replace('\n', ' ')
         if 'wait' in raw_targets.lower() or 'wating' in raw_targets.lower():
@@ -195,7 +175,6 @@ def parse_signal(text, timestamp=None, custom_id=None):
     else:
         signal['targets'] = []
 
-    # 7. Leverage & SL
     if lev_match := re.search(PATTERNS['leverage'], clean_text, re.IGNORECASE):
         signal['leverage'] = lev_match.group(1).strip()
     else:
@@ -209,15 +188,22 @@ def parse_signal(text, timestamp=None, custom_id=None):
 def get_clean_id(id_value):
     return abs(int(id_value)) if id_value is not None else 0
 
+# --- UPDATED BACKFILL FUNCTION (Fixes Source Name) ---
 async def perform_backfill(client, valid_channels):
     while signals_collection is None:
         await asyncio.sleep(1)
     
-    # Only backfill active/vip channels to save time
     logger.info("⏳ Backfilling...")
     vip_clean_ids = {get_clean_id(v) for v in CHANNELS['vip']}
     
     for channel_id in valid_channels:
+        # Fetch Channel Title First
+        try:
+            entity = await client.get_entity(channel_id)
+            channel_title = getattr(entity, 'title', 'Unknown')
+        except:
+            channel_title = 'Backfill'
+
         try:
             async for message in client.iter_messages(channel_id, limit=30):
                 if not message.text: continue
@@ -227,7 +213,8 @@ async def perform_backfill(client, valid_channels):
                 parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id)
                 if parsed:
                     parsed['type'] = 'VIP' if (channel_id in vip_clean_ids) else 'Public'
-                    parsed['source'] = 'Backfill'
+                    # USE ACTUAL CHANNEL TITLE
+                    parsed['source'] = channel_title 
                     save_signal_to_db(parsed)
         except: pass
     logger.info("✅ Backfill Done.")
@@ -244,7 +231,6 @@ async def send_telegram_alert(signal):
 
     emoji = "🟢" if signal.get('direction') == 'Long' else "🔴"
     
-    # Handle "Wait" targets
     if 'Wait' in signal['targets']:
         targets_str = "   ⏳ TP: Wait for update"
     else:
@@ -295,15 +281,12 @@ async def websocket_handler(websocket):
 async def main():
     global mongo_client, signals_collection, deleted_collection
     
-    # 1. Server First
     logger.info(f"🚀 Starting Server on port {PORT}...")
     server = await websockets.serve(websocket_handler, "0.0.0.0", PORT, ping_interval=20, ping_timeout=20)
 
-    # 2. Background App
     async def bootstrap_app():
         global mongo_client, signals_collection, deleted_collection
         
-        # Connect DB
         if MONGO_URI:
             try:
                 mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
@@ -313,7 +296,6 @@ async def main():
                 logger.info("✅ MongoDB Connected")
             except: return
 
-        # Connect Telegram
         if SESSION_STRING:
             try:
                 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -327,7 +309,6 @@ async def main():
                         valid_channels_set.add(get_clean_id(entity.id))
                     except: pass
 
-                # Handlers
                 async def process_event(event):
                     global MSGS_SCANNED, SIGNALS_SENT, LAST_SIGNAL_TIME
                     if event.sender_id == BOT_ID: return 
@@ -357,7 +338,6 @@ async def main():
                             LAST_SIGNAL_TIME = time.time()
                             await send_telegram_alert(parsed)
 
-                # Admin Commands
                 @client.on(events.NewMessage(pattern='/'))
                 async def admin_handler(event):
                     global SCRAPER_PAUSED
