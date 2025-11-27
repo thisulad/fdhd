@@ -30,6 +30,7 @@ SCRAPER_PAUSED = False
 MSGS_SCANNED = 0
 SIGNALS_SENT = 0
 LAST_SIGNAL_TIME = None
+CHANNEL_NAMES_CACHE = {} # New Cache for Channel Titles
 
 # DB Placeholders
 mongo_client = None
@@ -95,7 +96,15 @@ def save_signal_to_db(signal_data):
     if is_deleted(signal_data['id']): return False
     try:
         existing = signals_collection.find_one({'id': signal_data['id']})
-        signals_collection.update_one({'id': signal_data['id']}, {'$set': signal_data}, upsert=True)
+        # Ensure we don't overwrite an existing proper source with "Backfill" if logic fails
+        if existing and signal_data['source'] == 'Backfill' and existing['source'] != 'Backfill':
+            signal_data['source'] = existing['source']
+            
+        signals_collection.update_one(
+            {'id': signal_data['id']},
+            {'$set': signal_data},
+            upsert=True
+        )
         return existing is None
     except PyMongoError as e:
         logger.error(f"⚠️ DB Save Error: {e}")
@@ -112,14 +121,19 @@ def delete_signal(signal_id):
     if signals_collection is None: return
     try:
         signals_collection.delete_one({'id': str(signal_id)})
-        deleted_collection.update_one({'id': str(signal_id)}, {'$set': {'id': str(signal_id), 'deleted_at': time.time()}}, upsert=True)
+        deleted_collection.update_one(
+            {'id': str(signal_id)},
+            {'$set': {'id': str(signal_id), 'deleted_at': time.time()}},
+            upsert=True
+        )
         logger.info(f"🗑️ Deleted signal {signal_id}")
     except PyMongoError: pass
 
-# --- PARSING ENGINE (UPDATED FOR VIP TRUST) ---
-def parse_signal(text, timestamp=None, custom_id=None, is_vip=False):
+# --- PARSING ENGINE ---
+def parse_signal(text, timestamp=None, custom_id=None):
     if not text: return None
     
+    # NORMALIZE FANCY FONTS
     normalized_text = unicodedata.normalize('NFKC', text)
     clean_text = normalized_text.replace('**', '').replace('__', '').replace('`', '').strip()
     
@@ -129,13 +143,9 @@ def parse_signal(text, timestamp=None, custom_id=None, is_vip=False):
     raw_pair = pair_match.group(1).upper().replace('/', '')
     if raw_pair in BLACKLIST_PAIRS or len(raw_pair) < 3: return None
     
-    # --- VIP TRUST LOGIC ---
-    # If it's a VIP channel, we skip the strict "USD/BTC" check.
-    # If it's Public, we enforce it to prevent spam.
-    if not is_vip:
-        is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
-        has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
-        if not is_major and not has_direction: return None
+    is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
+    has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
+    if not is_major and not has_direction: return None
 
     ts = timestamp if timestamp else time.time()
     sig_id = str(custom_id) if custom_id else str(int(ts * 1000))
@@ -151,13 +161,11 @@ def parse_signal(text, timestamp=None, custom_id=None, is_vip=False):
         elif d == 'Sell': signal['direction'] = 'Short'
         else: signal['direction'] = d
     else:
-        # Default direction based on keywords if missing
-        if 'Long' in clean_text: signal['direction'] = 'Long'
-        elif 'Short' in clean_text: signal['direction'] = 'Short'
-        else: signal['direction'] = 'Unknown'
+        signal['direction'] = 'Unknown'
 
     if entry_match := re.search(PATTERNS['entry'], clean_text, re.IGNORECASE):
-        signal['entry'] = entry_match.group(1).strip().lstrip('-').strip()
+        raw_entry = entry_match.group(1).strip().lstrip('-').strip()
+        signal['entry'] = raw_entry
     else:
         signal['entry'] = 'Market'
 
@@ -192,28 +200,24 @@ async def perform_backfill(client, valid_channels):
     vip_clean_ids = {get_clean_id(v) for v in CHANNELS['vip']}
     
     for channel_id in valid_channels:
+        # TRY TO GET NAME FROM CACHE FIRST
+        clean_id = get_clean_id(channel_id)
+        channel_title = CHANNEL_NAMES_CACHE.get(clean_id, "Unknown Channel")
+        
         try:
-            # Fetch Channel Title
-            try:
-                entity = await client.get_entity(channel_id)
-                channel_title = getattr(entity, 'title', 'Unknown')
-            except:
-                channel_title = 'Backfill'
-
-            is_vip_channel = channel_id in vip_clean_ids
-
             async for message in client.iter_messages(channel_id, limit=30):
                 if not message.text: continue
                 unique_id = f"tg_{channel_id}_{message.id}"
                 if is_deleted(unique_id): continue
                 
-                # Pass is_vip=True to Backfill too
-                parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id, is_vip=is_vip_channel)
+                parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id)
                 if parsed:
-                    parsed['type'] = 'VIP' if is_vip_channel else 'Public'
-                    parsed['source'] = channel_title 
+                    parsed['type'] = 'VIP' if (channel_id in vip_clean_ids) else 'Public'
+                    parsed['source'] = channel_title  # Apply Cached Name
                     save_signal_to_db(parsed)
-        except: pass
+        except Exception as e:
+            logger.warning(f"Backfill skip {channel_id}: {e}")
+            pass
     logger.info("✅ Backfill Done.")
 
 async def broadcast_signal(signal_data, delete_action=False):
@@ -227,12 +231,7 @@ async def send_telegram_alert(signal):
     if not BOT_TOKEN or not BOT_CHAT_ID: return
 
     emoji = "🟢" if signal.get('direction') == 'Long' else "🔴"
-    
-    if 'Wait' in signal['targets']:
-        targets_str = "   ⏳ TP: Wait for update"
-    else:
-        targets_str = "\n".join([f"   🎯 {t}" for t in signal['targets']])
-    
+    targets_str = "   ⏳ TP: Wait" if 'Wait' in signal['targets'] else "\n".join([f"   🎯 {t}" for t in signal['targets']])
     sl_str = f"\n🛑 **SL:** {signal.get('stop_loss', 'N/A')}" if signal.get('stop_loss') else ""
     
     msg = (f"⚡ **{signal['pair']}** {emoji} **{signal['direction'].upper()}**\n\n"
@@ -248,8 +247,7 @@ async def send_telegram_alert(signal):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload) as response:
-                if response.status != 200:
-                    logger.error(f"Alert Failed: {await response.text()}")
+                if response.status != 200: logger.error(f"Alert Failed: {await response.text()}")
     except: pass
 
 async def websocket_handler(websocket):
@@ -299,14 +297,28 @@ async def main():
                 logger.info("🔌 Connecting Telegram...")
                 await client.start()
                 
+                # --- CACHE WARMUP (Fix for Channel Names) ---
+                logger.info("📇 Fetching Channel Names...")
+                try:
+                    async for dialog in client.iter_dialogs(limit=100):
+                        # Map both clean ID and raw ID to the name
+                        clean_id = get_clean_id(dialog.id)
+                        CHANNEL_NAMES_CACHE[clean_id] = dialog.name
+                        CHANNEL_NAMES_CACHE[dialog.id] = dialog.name
+                    logger.info(f"✅ Cached {len(CHANNEL_NAMES_CACHE)} channels.")
+                except Exception as e:
+                    logger.error(f"Cache Warning: {e}")
+
                 valid_channels_set = set()
                 for chat in CHANNELS['public'] + CHANNELS['vip']:
                     try:
+                        # Ensure we have the entity available
                         entity = await client.get_entity(chat)
                         valid_channels_set.add(get_clean_id(entity.id))
+                        # Double check name is in cache
+                        CHANNEL_NAMES_CACHE[get_clean_id(entity.id)] = getattr(entity, 'title', 'Unknown')
                     except: pass
 
-                # --- SIGNAL HANDLER ---
                 async def process_event(event):
                     global MSGS_SCANNED, SIGNALS_SENT, LAST_SIGNAL_TIME
                     if event.sender_id == BOT_ID: return 
@@ -319,21 +331,14 @@ async def main():
                     unique_id = f"tg_{clean_id}_{event.id}"
                     if is_deleted(unique_id): return
                     
-                    # Check if VIP to bypass strict filters
-                    vip_ids = {get_clean_id(x) for x in CHANNELS['vip']}
-                    is_vip_channel = clean_id in vip_ids
-                    
-                    parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id, is_vip=is_vip_channel)
-                    
+                    parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
                     if parsed:
-                        if is_vip_channel:
-                            parsed['type'] = 'VIP'
-                            chat_obj = await event.get_chat()
-                            parsed['source'] = getattr(chat_obj, 'title', 'Channel')
-                        elif clean_id in valid_channels_set:
-                            parsed['type'] = 'Public'
-                            chat_obj = await event.get_chat()
-                            parsed['source'] = getattr(chat_obj, 'title', 'Channel')
+                        if clean_id in valid_channels_set:
+                            vip_ids = [get_clean_id(x) for x in CHANNELS['vip']]
+                            parsed['type'] = 'VIP' if (clean_id in vip_ids) else 'Public'
+                            
+                            # USE CACHED NAME
+                            parsed['source'] = CHANNEL_NAMES_CACHE.get(clean_id, "Unknown Channel")
                         else:
                             parsed['source'] = 'Saved'; parsed['type'] = 'Manual'
                         
@@ -343,11 +348,6 @@ async def main():
                             SIGNALS_SENT += 1
                             LAST_SIGNAL_TIME = time.time()
                             await send_telegram_alert(parsed)
-                    
-                    # --- DEBUG: LOG IGNORED VIP MESSAGES ---
-                    # If it came from a VIP channel but FAILED parsing, show us why
-                    elif is_vip_channel:
-                        logger.info(f"⚠️ [DEBUG] IGNORED VIP MSG: {event.text[:50]}...")
 
                 @client.on(events.NewMessage(pattern='/'))
                 async def admin_handler(event):
