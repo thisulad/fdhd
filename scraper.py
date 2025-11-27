@@ -83,9 +83,7 @@ def format_uptime(seconds):
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
     d, h = divmod(h, 24)
-    if d > 0: return f"{int(d)}d {int(h)}h {int(m)}m"
-    if h > 0: return f"{int(h)}h {int(m)}m"
-    return f"{int(m)}m {int(s)}s"
+    return f"{int(d)}d {int(h)}h {int(m)}m"
 
 def is_deleted(signal_id):
     if deleted_collection is None: return False
@@ -97,11 +95,7 @@ def save_signal_to_db(signal_data):
     if is_deleted(signal_data['id']): return False
     try:
         existing = signals_collection.find_one({'id': signal_data['id']})
-        signals_collection.update_one(
-            {'id': signal_data['id']},
-            {'$set': signal_data},
-            upsert=True
-        )
+        signals_collection.update_one({'id': signal_data['id']}, {'$set': signal_data}, upsert=True)
         return existing is None
     except PyMongoError as e:
         logger.error(f"⚠️ DB Save Error: {e}")
@@ -118,19 +112,14 @@ def delete_signal(signal_id):
     if signals_collection is None: return
     try:
         signals_collection.delete_one({'id': str(signal_id)})
-        deleted_collection.update_one(
-            {'id': str(signal_id)},
-            {'$set': {'id': str(signal_id), 'deleted_at': time.time()}},
-            upsert=True
-        )
+        deleted_collection.update_one({'id': str(signal_id)}, {'$set': {'id': str(signal_id), 'deleted_at': time.time()}}, upsert=True)
         logger.info(f"🗑️ Deleted signal {signal_id}")
     except PyMongoError: pass
 
-# --- PARSING ENGINE ---
-def parse_signal(text, timestamp=None, custom_id=None):
+# --- PARSING ENGINE (UPDATED FOR VIP TRUST) ---
+def parse_signal(text, timestamp=None, custom_id=None, is_vip=False):
     if not text: return None
     
-    # NORMALIZE FANCY FONTS
     normalized_text = unicodedata.normalize('NFKC', text)
     clean_text = normalized_text.replace('**', '').replace('__', '').replace('`', '').strip()
     
@@ -140,9 +129,13 @@ def parse_signal(text, timestamp=None, custom_id=None):
     raw_pair = pair_match.group(1).upper().replace('/', '')
     if raw_pair in BLACKLIST_PAIRS or len(raw_pair) < 3: return None
     
-    is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
-    has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
-    if not is_major and not has_direction: return None
+    # --- VIP TRUST LOGIC ---
+    # If it's a VIP channel, we skip the strict "USD/BTC" check.
+    # If it's Public, we enforce it to prevent spam.
+    if not is_vip:
+        is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
+        has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
+        if not is_major and not has_direction: return None
 
     ts = timestamp if timestamp else time.time()
     sig_id = str(custom_id) if custom_id else str(int(ts * 1000))
@@ -158,11 +151,13 @@ def parse_signal(text, timestamp=None, custom_id=None):
         elif d == 'Sell': signal['direction'] = 'Short'
         else: signal['direction'] = d
     else:
-        signal['direction'] = 'Unknown'
+        # Default direction based on keywords if missing
+        if 'Long' in clean_text: signal['direction'] = 'Long'
+        elif 'Short' in clean_text: signal['direction'] = 'Short'
+        else: signal['direction'] = 'Unknown'
 
     if entry_match := re.search(PATTERNS['entry'], clean_text, re.IGNORECASE):
-        raw_entry = entry_match.group(1).strip().lstrip('-').strip()
-        signal['entry'] = raw_entry
+        signal['entry'] = entry_match.group(1).strip().lstrip('-').strip()
     else:
         signal['entry'] = 'Market'
 
@@ -188,7 +183,7 @@ def parse_signal(text, timestamp=None, custom_id=None):
 def get_clean_id(id_value):
     return abs(int(id_value)) if id_value is not None else 0
 
-# --- UPDATED BACKFILL FUNCTION (Fixes Source Name) ---
+# --- BACKFILL ---
 async def perform_backfill(client, valid_channels):
     while signals_collection is None:
         await asyncio.sleep(1)
@@ -197,23 +192,25 @@ async def perform_backfill(client, valid_channels):
     vip_clean_ids = {get_clean_id(v) for v in CHANNELS['vip']}
     
     for channel_id in valid_channels:
-        # Fetch Channel Title First
         try:
-            entity = await client.get_entity(channel_id)
-            channel_title = getattr(entity, 'title', 'Unknown')
-        except:
-            channel_title = 'Backfill'
+            # Fetch Channel Title
+            try:
+                entity = await client.get_entity(channel_id)
+                channel_title = getattr(entity, 'title', 'Unknown')
+            except:
+                channel_title = 'Backfill'
 
-        try:
+            is_vip_channel = channel_id in vip_clean_ids
+
             async for message in client.iter_messages(channel_id, limit=30):
                 if not message.text: continue
                 unique_id = f"tg_{channel_id}_{message.id}"
                 if is_deleted(unique_id): continue
                 
-                parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id)
+                # Pass is_vip=True to Backfill too
+                parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id, is_vip=is_vip_channel)
                 if parsed:
-                    parsed['type'] = 'VIP' if (channel_id in vip_clean_ids) else 'Public'
-                    # USE ACTUAL CHANNEL TITLE
+                    parsed['type'] = 'VIP' if is_vip_channel else 'Public'
                     parsed['source'] = channel_title 
                     save_signal_to_db(parsed)
         except: pass
@@ -309,6 +306,7 @@ async def main():
                         valid_channels_set.add(get_clean_id(entity.id))
                     except: pass
 
+                # --- SIGNAL HANDLER ---
                 async def process_event(event):
                     global MSGS_SCANNED, SIGNALS_SENT, LAST_SIGNAL_TIME
                     if event.sender_id == BOT_ID: return 
@@ -321,13 +319,21 @@ async def main():
                     unique_id = f"tg_{clean_id}_{event.id}"
                     if is_deleted(unique_id): return
                     
-                    parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
+                    # Check if VIP to bypass strict filters
+                    vip_ids = {get_clean_id(x) for x in CHANNELS['vip']}
+                    is_vip_channel = clean_id in vip_ids
+                    
+                    parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id, is_vip=is_vip_channel)
+                    
                     if parsed:
-                        if clean_id in valid_channels_set:
-                            vip_ids = [get_clean_id(x) for x in CHANNELS['vip']]
-                            parsed['type'] = 'VIP' if (clean_id in vip_ids) else 'Public'
-                            chat = await event.get_chat()
-                            parsed['source'] = getattr(chat, 'title', 'Channel')
+                        if is_vip_channel:
+                            parsed['type'] = 'VIP'
+                            chat_obj = await event.get_chat()
+                            parsed['source'] = getattr(chat_obj, 'title', 'Channel')
+                        elif clean_id in valid_channels_set:
+                            parsed['type'] = 'Public'
+                            chat_obj = await event.get_chat()
+                            parsed['source'] = getattr(chat_obj, 'title', 'Channel')
                         else:
                             parsed['source'] = 'Saved'; parsed['type'] = 'Manual'
                         
@@ -337,10 +343,15 @@ async def main():
                             SIGNALS_SENT += 1
                             LAST_SIGNAL_TIME = time.time()
                             await send_telegram_alert(parsed)
+                    
+                    # --- DEBUG: LOG IGNORED VIP MESSAGES ---
+                    # If it came from a VIP channel but FAILED parsing, show us why
+                    elif is_vip_channel:
+                        logger.info(f"⚠️ [DEBUG] IGNORED VIP MSG: {event.text[:50]}...")
 
                 @client.on(events.NewMessage(pattern='/'))
                 async def admin_handler(event):
-                    global SCRAPER_PAUSED
+                    global SCRAPER_PAUSED, MSGS_SCANNED
                     if event.sender_id != ADMIN_ID: return
                     cmd = event.text.split()[0].lower()
                     
@@ -357,6 +368,13 @@ async def main():
                                f"**Telegram:** ✅ Connected\n"
                                f"**Last Signal:** {last_sig}")
                         await event.respond(msg)
+                    elif cmd == '/reset':
+                        try:
+                            signals_collection.delete_many({})
+                            MSGS_SCANNED = 0
+                            await event.respond("🧹 **Database Cleared!** Re-scanning...")
+                            asyncio.create_task(perform_backfill(client, valid_channels_set))
+                        except Exception as e: await event.respond(f"❌ Reset Failed: {e}")
                     elif cmd == '/pause':
                         SCRAPER_PAUSED = True
                         await event.respond("⏸ Paused")
