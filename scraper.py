@@ -30,7 +30,7 @@ SCRAPER_PAUSED = False
 MSGS_SCANNED = 0
 SIGNALS_SENT = 0
 LAST_SIGNAL_TIME = None
-CHANNEL_NAMES_CACHE = {} # New Cache for Channel Titles
+CHANNEL_NAMES_CACHE = {} 
 
 # DB Placeholders
 mongo_client = None
@@ -71,10 +71,17 @@ BLACKLIST_PAIRS = {
 
 PATTERNS = {
     'pair_strict': r'(?:\#|\$)?([A-Z0-9]{2,8}(?:/[A-Z0-9]{2,8})?)',
+    
     'direction': r'\b(Long|Short|Buy|Sell)\b',
-    'entry': r'(?:Entry|Buy|Sell|Short|Long|EP|Enter|Price|Above|Below|At)(?:\s*(?:Long|Short|Zone|Range|Price|Target|at|Above|Below|\-)?)?[\s:-]*([0-9\.,\s\-]+)',
+    
+    # UPDATED ENTRY: Handles "Sell / Short Above - 0.1424"
+    # The regex now allows slashes and spaces between keywords and numbers
+    'entry': r'(?:Entry|Buy|Sell|Short|Long|EP|Enter|Price|Above|Below|At)(?:[\s/\w]*(?:Long|Short|Zone|Range|Price|Target|at|Above|Below|\-))?[\s:-]*([0-9\.,\s\-]+)',
+    
     'targets': r'(?:Target\s*s?|TP\s*s?|Profit|Take\s*Profit|T\.P)[\s\n:-]*(wait|wating|[0-9\.,\s\-/✅]+)',
+    
     'leverage': r'(?:Lev(?:erage)?\s*|Margin\s*)?[:\s\-]*(?:Cross|Iso|Isolated)?\s*([0-9]+[xX](?:\s*or\s*[xX]?[0-9]+[xX]?)?)',
+    
     'stop_loss': r'(?:SL|Stop\s*Loss)[\s:-]*(wait|wating|[0-9\.]+)'
 }
 
@@ -91,12 +98,11 @@ def is_deleted(signal_id):
     return deleted_collection.find_one({'id': signal_id}) is not None
 
 def save_signal_to_db(signal_data):
-    if signals_collection is None: return False
-    if not signal_data or 'id' not in signal_data: return False
-    if is_deleted(signal_data['id']): return False
+    if signals_collection is None: return False, None
+    if not signal_data or 'id' not in signal_data: return False, None
+    if is_deleted(signal_data['id']): return False, None
     try:
         existing = signals_collection.find_one({'id': signal_data['id']})
-        # Ensure we don't overwrite an existing proper source with "Backfill" if logic fails
         if existing and signal_data['source'] == 'Backfill' and existing['source'] != 'Backfill':
             signal_data['source'] = existing['source']
             
@@ -105,10 +111,10 @@ def save_signal_to_db(signal_data):
             {'$set': signal_data},
             upsert=True
         )
-        return existing is None
+        return existing is None, existing
     except PyMongoError as e:
         logger.error(f"⚠️ DB Save Error: {e}")
-        return False
+        return False, None
 
 def get_recent_history(limit=50):
     if signals_collection is None: return []
@@ -130,10 +136,9 @@ def delete_signal(signal_id):
     except PyMongoError: pass
 
 # --- PARSING ENGINE ---
-def parse_signal(text, timestamp=None, custom_id=None):
+def parse_signal(text, timestamp=None, custom_id=None, is_vip=False):
     if not text: return None
     
-    # NORMALIZE FANCY FONTS
     normalized_text = unicodedata.normalize('NFKC', text)
     clean_text = normalized_text.replace('**', '').replace('__', '').replace('`', '').strip()
     
@@ -143,9 +148,12 @@ def parse_signal(text, timestamp=None, custom_id=None):
     raw_pair = pair_match.group(1).upper().replace('/', '')
     if raw_pair in BLACKLIST_PAIRS or len(raw_pair) < 3: return None
     
-    is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
-    has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
-    if not is_major and not has_direction: return None
+    # --- VIP TRUST FIX ---
+    # If it is NOT VIP, we enforce strict filters. If VIP, we trust it.
+    if not is_vip:
+        is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
+        has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
+        if not is_major and not has_direction: return None
 
     ts = timestamp if timestamp else time.time()
     sig_id = str(custom_id) if custom_id else str(int(ts * 1000))
@@ -191,7 +199,6 @@ def parse_signal(text, timestamp=None, custom_id=None):
 def get_clean_id(id_value):
     return abs(int(id_value)) if id_value is not None else 0
 
-# --- BACKFILL ---
 async def perform_backfill(client, valid_channels):
     while signals_collection is None:
         await asyncio.sleep(1)
@@ -200,24 +207,22 @@ async def perform_backfill(client, valid_channels):
     vip_clean_ids = {get_clean_id(v) for v in CHANNELS['vip']}
     
     for channel_id in valid_channels:
-        # TRY TO GET NAME FROM CACHE FIRST
         clean_id = get_clean_id(channel_id)
         channel_title = CHANNEL_NAMES_CACHE.get(clean_id, "Unknown Channel")
-        
+        is_vip = clean_id in vip_clean_ids
+
         try:
             async for message in client.iter_messages(channel_id, limit=30):
                 if not message.text: continue
                 unique_id = f"tg_{channel_id}_{message.id}"
                 if is_deleted(unique_id): continue
                 
-                parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id)
+                parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id, is_vip=is_vip)
                 if parsed:
-                    parsed['type'] = 'VIP' if (channel_id in vip_clean_ids) else 'Public'
-                    parsed['source'] = channel_title  # Apply Cached Name
+                    parsed['type'] = 'VIP' if is_vip else 'Public'
+                    parsed['source'] = channel_title
                     save_signal_to_db(parsed)
-        except Exception as e:
-            logger.warning(f"Backfill skip {channel_id}: {e}")
-            pass
+        except: pass
     logger.info("✅ Backfill Done.")
 
 async def broadcast_signal(signal_data, delete_action=False):
@@ -227,14 +232,16 @@ async def broadcast_signal(signal_data, delete_action=False):
         await asyncio.gather(*[client.send(msg) for client in connected_clients], return_exceptions=True)
     except: pass
 
-async def send_telegram_alert(signal):
+async def send_telegram_alert(signal, is_update=False):
     if not BOT_TOKEN or not BOT_CHAT_ID: return
 
     emoji = "🟢" if signal.get('direction') == 'Long' else "🔴"
+    header = "🔔 **UPDATE:**" if is_update else f"⚡ **{signal['pair']}**"
+    
     targets_str = "   ⏳ TP: Wait" if 'Wait' in signal['targets'] else "\n".join([f"   🎯 {t}" for t in signal['targets']])
     sl_str = f"\n🛑 **SL:** {signal.get('stop_loss', 'N/A')}" if signal.get('stop_loss') else ""
     
-    msg = (f"⚡ **{signal['pair']}** {emoji} **{signal['direction'].upper()}**\n\n"
+    msg = (f"{header} {emoji} **{signal['direction'].upper()}**\n\n"
            f"📥 **Entry:** {signal['entry']}\n"
            f"⚙️ **Lev:** {signal['leverage']}"
            f"{sl_str}\n\n"
@@ -297,25 +304,18 @@ async def main():
                 logger.info("🔌 Connecting Telegram...")
                 await client.start()
                 
-                # --- CACHE WARMUP (Fix for Channel Names) ---
-                logger.info("📇 Fetching Channel Names...")
+                logger.info("📇 Warming up Cache...")
                 try:
                     async for dialog in client.iter_dialogs(limit=100):
-                        # Map both clean ID and raw ID to the name
                         clean_id = get_clean_id(dialog.id)
                         CHANNEL_NAMES_CACHE[clean_id] = dialog.name
-                        CHANNEL_NAMES_CACHE[dialog.id] = dialog.name
-                    logger.info(f"✅ Cached {len(CHANNEL_NAMES_CACHE)} channels.")
-                except Exception as e:
-                    logger.error(f"Cache Warning: {e}")
+                except: pass
 
                 valid_channels_set = set()
                 for chat in CHANNELS['public'] + CHANNELS['vip']:
                     try:
-                        # Ensure we have the entity available
                         entity = await client.get_entity(chat)
                         valid_channels_set.add(get_clean_id(entity.id))
-                        # Double check name is in cache
                         CHANNEL_NAMES_CACHE[get_clean_id(entity.id)] = getattr(entity, 'title', 'Unknown')
                     except: pass
 
@@ -331,23 +331,32 @@ async def main():
                     unique_id = f"tg_{clean_id}_{event.id}"
                     if is_deleted(unique_id): return
                     
-                    parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
+                    vip_ids = {get_clean_id(x) for x in CHANNELS['vip']}
+                    is_vip = clean_id in vip_ids
+                    
+                    parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id, is_vip=is_vip)
+                    
                     if parsed:
-                        if clean_id in valid_channels_set:
-                            vip_ids = [get_clean_id(x) for x in CHANNELS['vip']]
-                            parsed['type'] = 'VIP' if (clean_id in vip_ids) else 'Public'
-                            
-                            # USE CACHED NAME
-                            parsed['source'] = CHANNEL_NAMES_CACHE.get(clean_id, "Unknown Channel")
+                        if is_vip:
+                            parsed['type'] = 'VIP'
+                            parsed['source'] = CHANNEL_NAMES_CACHE.get(clean_id, "VIP Channel")
+                        elif clean_id in valid_channels_set:
+                            parsed['type'] = 'Public'
+                            parsed['source'] = CHANNEL_NAMES_CACHE.get(clean_id, "Public Channel")
                         else:
                             parsed['source'] = 'Saved'; parsed['type'] = 'Manual'
                         
-                        is_new = save_signal_to_db(parsed)
+                        is_new, existing = save_signal_to_db(parsed)
                         await broadcast_signal(parsed)
+                        
                         if is_new: 
                             SIGNALS_SENT += 1
                             LAST_SIGNAL_TIME = time.time()
                             await send_telegram_alert(parsed)
+                        # FIX: Send alert if entry updated from "Market" to real number
+                        elif existing and existing.get('entry') == 'Market' and parsed['entry'] != 'Market':
+                            logger.info(f"🔔 Signal Updated: {parsed['pair']}")
+                            await send_telegram_alert(parsed, is_update=True)
 
                 @client.on(events.NewMessage(pattern='/'))
                 async def admin_handler(event):
