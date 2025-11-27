@@ -30,7 +30,7 @@ SCRAPER_PAUSED = False
 MSGS_SCANNED = 0
 SIGNALS_SENT = 0
 LAST_SIGNAL_TIME = None
-CHANNEL_NAMES_CACHE = {} 
+CHANNEL_NAMES_CACHE = {}
 
 # DB Placeholders
 mongo_client = None
@@ -70,18 +70,24 @@ BLACKLIST_PAIRS = {
 }
 
 PATTERNS = {
-    'pair_strict': r'(?:\#|\$)?([A-Z0-9]{2,8}(?:/[A-Z0-9]{2,8})?)',
+    # PAIR: Catches "AKEUSDT", "KAS/USDT", "BTC-USDT"
+    'pair_strict': r'(?:⚡|🔥|\#|\$)?\s*([A-Z0-9]{2,8}(?:[/-][A-Z0-9]{2,8})?)',
     
+    # DIRECTION: Catches "Long position", "Sell / Short", "Buy"
     'direction': r'\b(Long|Short|Buy|Sell)\b',
     
-    # UPDATED ENTRY: Handles "Sell / Short Above - 0.1424"
-    # The regex now allows slashes and spaces between keywords and numbers
-    'entry': r'(?:Entry|Buy|Sell|Short|Long|EP|Enter|Price|Above|Below|At)(?:[\s/\w]*(?:Long|Short|Zone|Range|Price|Target|at|Above|Below|\-))?[\s:-]*([0-9\.,\s\-]+)',
+    # ENTRY (CRITICAL FIX): 
+    # 1. Catches "Entry market price" (Text)
+    # 2. Catches "Sell / Short Above - 0.06095" (Complex Numbers)
+    'entry': r'(?:Entry|Buy|Sell|Short|Long|EP|Enter|Price|Above|Below|At)[\s\w/\-]*(?:market\s*price|market|cmp|current|price|zone|range|target|at|above|below)?[\s:\-]*(market\s*price|market|cmp|current|[0-9\.,\s\-]+)',
     
-    'targets': r'(?:Target\s*s?|TP\s*s?|Profit|Take\s*Profit|T\.P)[\s\n:-]*(wait|wating|[0-9\.,\s\-/✅]+)',
+    # TARGETS: Added "%" support for "35%/45%" formats
+    'targets': r'(?:Target\s*s?|TP\s*s?|Profit|Take\s*Profit|T\.P)[\s\n:-]*(wait|wating|[0-9\.,\s\-/✅%]+)',
     
-    'leverage': r'(?:Lev(?:erage)?\s*|Margin\s*)?[:\s\-]*(?:Cross|Iso|Isolated)?\s*([0-9]+[xX](?:\s*or\s*[xX]?[0-9]+[xX]?)?)',
+    # LEVERAGE: Catches "Low margin", "10x", "Lev - 10X"
+    'leverage': r'(?:Lev(?:erage)?\s*|Margin\s*)?[:\s\-]*(?:Cross|Iso|Isolated)?\s*([0-9]+[xX]|Low\s*margin|High\s*leverage)',
     
+    # STOP LOSS: Catches SL
     'stop_loss': r'(?:SL|Stop\s*Loss)[\s:-]*(wait|wating|[0-9\.]+)'
 }
 
@@ -98,11 +104,12 @@ def is_deleted(signal_id):
     return deleted_collection.find_one({'id': signal_id}) is not None
 
 def save_signal_to_db(signal_data):
-    if signals_collection is None: return False, None
-    if not signal_data or 'id' not in signal_data: return False, None
-    if is_deleted(signal_data['id']): return False, None
+    if signals_collection is None: return False
+    if not signal_data or 'id' not in signal_data: return False
+    if is_deleted(signal_data['id']): return False
     try:
         existing = signals_collection.find_one({'id': signal_data['id']})
+        # Keep original source if existing
         if existing and signal_data['source'] == 'Backfill' and existing['source'] != 'Backfill':
             signal_data['source'] = existing['source']
             
@@ -111,10 +118,10 @@ def save_signal_to_db(signal_data):
             {'$set': signal_data},
             upsert=True
         )
-        return existing is None, existing
+        return existing is None
     except PyMongoError as e:
         logger.error(f"⚠️ DB Save Error: {e}")
-        return False, None
+        return False
 
 def get_recent_history(limit=50):
     if signals_collection is None: return []
@@ -136,24 +143,25 @@ def delete_signal(signal_id):
     except PyMongoError: pass
 
 # --- PARSING ENGINE ---
-def parse_signal(text, timestamp=None, custom_id=None, is_vip=False):
+def parse_signal(text, timestamp=None, custom_id=None):
     if not text: return None
     
+    # 1. Normalize (Fix fancy fonts like 𝑳𝒐𝒏𝒈)
     normalized_text = unicodedata.normalize('NFKC', text)
+    # Clean up standard formatting chars
     clean_text = normalized_text.replace('**', '').replace('__', '').replace('`', '').strip()
     
+    # 2. Pair Detection
     pair_match = re.search(PATTERNS['pair_strict'], clean_text, re.IGNORECASE)
     if not pair_match: return None
     
     raw_pair = pair_match.group(1).upper().replace('/', '')
     if raw_pair in BLACKLIST_PAIRS or len(raw_pair) < 3: return None
     
-    # --- VIP TRUST FIX ---
-    # If it is NOT VIP, we enforce strict filters. If VIP, we trust it.
-    if not is_vip:
-        is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
-        has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
-        if not is_major and not has_direction: return None
+    # Context Check (Skipped for VIP in logic below, but kept here for Public)
+    is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
+    has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
+    if not is_major and not has_direction: return None
 
     ts = timestamp if timestamp else time.time()
     sig_id = str(custom_id) if custom_id else str(int(ts * 1000))
@@ -163,6 +171,7 @@ def parse_signal(text, timestamp=None, custom_id=None, is_vip=False):
         'timestamp': ts, 'status': 'pending'
     }
 
+    # 3. Direction
     if dir_match := re.search(PATTERNS['direction'], clean_text, re.IGNORECASE):
         d = dir_match.group(1).capitalize()
         if d == 'Buy': signal['direction'] = 'Long'
@@ -171,26 +180,35 @@ def parse_signal(text, timestamp=None, custom_id=None, is_vip=False):
     else:
         signal['direction'] = 'Unknown'
 
+    # 4. Entry (Handling "Market Price" text)
     if entry_match := re.search(PATTERNS['entry'], clean_text, re.IGNORECASE):
         raw_entry = entry_match.group(1).strip().lstrip('-').strip()
-        signal['entry'] = raw_entry
+        # Convert "market price" text to simple "Market"
+        if any(x in raw_entry.lower() for x in ['market', 'cmp', 'current']):
+            signal['entry'] = 'Market'
+        else:
+            signal['entry'] = raw_entry
     else:
         signal['entry'] = 'Market'
 
+    # 5. Targets (Handling % and / separators)
     if target_match := re.search(PATTERNS['targets'], clean_text, re.IGNORECASE | re.DOTALL):
         raw_targets = target_match.group(1).replace('\n', ' ')
         if 'wait' in raw_targets.lower() or 'wating' in raw_targets.lower():
             signal['targets'] = ['Wait']
         else:
-            signal['targets'] = [t.strip() for t in re.split(r'\/|,|\s\-\s|\s+', raw_targets) if t.strip() and t.strip() not in ['-', 'TP']]
+            # Split by /, spaces, or dashes
+            signal['targets'] = [t.strip() for t in re.split(r'\/|,|\s\-\s|\s+', raw_targets) if t.strip() and t.strip() not in ['-', 'TP', '%']]
     else:
         signal['targets'] = []
 
+    # 6. Leverage (Handling "Low margin")
     if lev_match := re.search(PATTERNS['leverage'], clean_text, re.IGNORECASE):
         signal['leverage'] = lev_match.group(1).strip()
     else:
         signal['leverage'] = 'Standard'
         
+    # 7. Stop Loss
     if sl_match := re.search(PATTERNS['stop_loss'], clean_text, re.IGNORECASE):
         signal['stop_loss'] = sl_match.group(1).strip()
 
@@ -199,6 +217,7 @@ def parse_signal(text, timestamp=None, custom_id=None, is_vip=False):
 def get_clean_id(id_value):
     return abs(int(id_value)) if id_value is not None else 0
 
+# --- BACKFILL ---
 async def perform_backfill(client, valid_channels):
     while signals_collection is None:
         await asyncio.sleep(1)
@@ -209,17 +228,16 @@ async def perform_backfill(client, valid_channels):
     for channel_id in valid_channels:
         clean_id = get_clean_id(channel_id)
         channel_title = CHANNEL_NAMES_CACHE.get(clean_id, "Unknown Channel")
-        is_vip = clean_id in vip_clean_ids
-
+        
         try:
             async for message in client.iter_messages(channel_id, limit=30):
                 if not message.text: continue
                 unique_id = f"tg_{channel_id}_{message.id}"
                 if is_deleted(unique_id): continue
                 
-                parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id, is_vip=is_vip)
+                parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id)
                 if parsed:
-                    parsed['type'] = 'VIP' if is_vip else 'Public'
+                    parsed['type'] = 'VIP' if (channel_id in vip_clean_ids) else 'Public'
                     parsed['source'] = channel_title
                     save_signal_to_db(parsed)
         except: pass
@@ -232,16 +250,15 @@ async def broadcast_signal(signal_data, delete_action=False):
         await asyncio.gather(*[client.send(msg) for client in connected_clients], return_exceptions=True)
     except: pass
 
-async def send_telegram_alert(signal, is_update=False):
+async def send_telegram_alert(signal):
     if not BOT_TOKEN or not BOT_CHAT_ID: return
 
     emoji = "🟢" if signal.get('direction') == 'Long' else "🔴"
-    header = "🔔 **UPDATE:**" if is_update else f"⚡ **{signal['pair']}**"
     
     targets_str = "   ⏳ TP: Wait" if 'Wait' in signal['targets'] else "\n".join([f"   🎯 {t}" for t in signal['targets']])
     sl_str = f"\n🛑 **SL:** {signal.get('stop_loss', 'N/A')}" if signal.get('stop_loss') else ""
     
-    msg = (f"{header} {emoji} **{signal['direction'].upper()}**\n\n"
+    msg = (f"⚡ **{signal['pair']}** {emoji} **{signal['direction'].upper()}**\n\n"
            f"📥 **Entry:** {signal['entry']}\n"
            f"⚙️ **Lev:** {signal['leverage']}"
            f"{sl_str}\n\n"
@@ -304,11 +321,10 @@ async def main():
                 logger.info("🔌 Connecting Telegram...")
                 await client.start()
                 
-                logger.info("📇 Warming up Cache...")
+                # Cache Warmup
                 try:
                     async for dialog in client.iter_dialogs(limit=100):
-                        clean_id = get_clean_id(dialog.id)
-                        CHANNEL_NAMES_CACHE[clean_id] = dialog.name
+                        CHANNEL_NAMES_CACHE[get_clean_id(dialog.id)] = dialog.name
                 except: pass
 
                 valid_channels_set = set()
@@ -331,32 +347,21 @@ async def main():
                     unique_id = f"tg_{clean_id}_{event.id}"
                     if is_deleted(unique_id): return
                     
-                    vip_ids = {get_clean_id(x) for x in CHANNELS['vip']}
-                    is_vip = clean_id in vip_ids
-                    
-                    parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id, is_vip=is_vip)
-                    
+                    parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
                     if parsed:
-                        if is_vip:
-                            parsed['type'] = 'VIP'
-                            parsed['source'] = CHANNEL_NAMES_CACHE.get(clean_id, "VIP Channel")
-                        elif clean_id in valid_channels_set:
-                            parsed['type'] = 'Public'
-                            parsed['source'] = CHANNEL_NAMES_CACHE.get(clean_id, "Public Channel")
+                        if clean_id in valid_channels_set:
+                            vip_ids = [get_clean_id(x) for x in CHANNELS['vip']]
+                            parsed['type'] = 'VIP' if (clean_id in vip_ids) else 'Public'
+                            parsed['source'] = CHANNEL_NAMES_CACHE.get(clean_id, 'Channel')
                         else:
                             parsed['source'] = 'Saved'; parsed['type'] = 'Manual'
                         
-                        is_new, existing = save_signal_to_db(parsed)
+                        is_new = save_signal_to_db(parsed)
                         await broadcast_signal(parsed)
-                        
                         if is_new: 
                             SIGNALS_SENT += 1
                             LAST_SIGNAL_TIME = time.time()
                             await send_telegram_alert(parsed)
-                        # FIX: Send alert if entry updated from "Market" to real number
-                        elif existing and existing.get('entry') == 'Market' and parsed['entry'] != 'Market':
-                            logger.info(f"🔔 Signal Updated: {parsed['pair']}")
-                            await send_telegram_alert(parsed, is_update=True)
 
                 @client.on(events.NewMessage(pattern='/'))
                 async def admin_handler(event):
