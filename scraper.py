@@ -44,10 +44,10 @@ except (AttributeError, IndexError, ValueError):
     BOT_ID = 0
     ADMIN_ID = 0
 
-# --- CHANNELS ---
+# --- CHANNELS (Your VIP IDs) ---
 CHANNELS = {
     'public': ['Binancesignalwithishara', 'me'],
-    'vip': [-1002138095358, -1001905653511]
+    'vip': [-1002138095358, -1001905653511] # Ensure this ID is correct!
 }
 
 # --- LOGGING ---
@@ -70,22 +70,20 @@ BLACKLIST_PAIRS = {
 }
 
 PATTERNS = {
-    # PAIR: Catches "AKEUSDT", "KAS/USDT", "BTC-USDT"
+    # PAIR: Catches "AKEUSDT", "KAS/USDT"
     'pair_strict': r'(?:⚡|🔥|\#|\$)?\s*([A-Z0-9]{2,8}(?:[/-][A-Z0-9]{2,8})?)',
     
-    # DIRECTION: Catches "Long position", "Sell / Short", "Buy"
+    # DIRECTION: Catches "Long position", "Sell / Short"
     'direction': r'\b(Long|Short|Buy|Sell)\b',
     
-    # ENTRY (CRITICAL FIX): 
-    # 1. Catches "Entry market price" (Text)
-    # 2. Catches "Sell / Short Above - 0.06095" (Complex Numbers)
+    # ENTRY (CRITICAL FIX): Catches "Entry market price", "Above - 0.14"
     'entry': r'(?:Entry|Buy|Sell|Short|Long|EP|Enter|Price|Above|Below|At)[\s\w/\-]*(?:market\s*price|market|cmp|current|price|zone|range|target|at|above|below)?[\s:\-]*(market\s*price|market|cmp|current|[0-9\.,\s\-]+)',
     
-    # TARGETS: Added "%" support for "35%/45%" formats
+    # TARGETS: Handles "35%/45%" and "TP-wait"
     'targets': r'(?:Target\s*s?|TP\s*s?|Profit|Take\s*Profit|T\.P)[\s\n:-]*(wait|wating|[0-9\.,\s\-/✅%]+)',
     
-    # LEVERAGE: Catches "Low margin", "10x", "Lev - 10X"
-    'leverage': r'(?:Lev(?:erage)?\s*|Margin\s*)?[:\s\-]*(?:Cross|Iso|Isolated)?\s*([0-9]+[xX]|Low\s*margin|High\s*leverage)',
+    # LEVERAGE: Catches "Low margin", "laverage", "10X"
+    'leverage': r'(?:Lev(?:erage|erge|rage)?\s*|Margin\s*)?[:\s\-]*(?:Cross|Iso|Isolated)?\s*([0-9]+[xX]|Low\s*margin|High\s*leverage)',
     
     # STOP LOSS: Catches SL
     'stop_loss': r'(?:SL|Stop\s*Loss)[\s:-]*(wait|wating|[0-9\.]+)'
@@ -109,8 +107,8 @@ def save_signal_to_db(signal_data):
     if is_deleted(signal_data['id']): return False
     try:
         existing = signals_collection.find_one({'id': signal_data['id']})
-        # Keep original source if existing
-        if existing and signal_data['source'] == 'Backfill' and existing['source'] != 'Backfill':
+        # Persist source name so it doesn't revert to "Backfill"
+        if existing and signal_data['source'] == 'Backfill' and existing.get('source') != 'Backfill':
             signal_data['source'] = existing['source']
             
         signals_collection.update_one(
@@ -146,9 +144,8 @@ def delete_signal(signal_id):
 def parse_signal(text, timestamp=None, custom_id=None):
     if not text: return None
     
-    # 1. Normalize (Fix fancy fonts like 𝑳𝒐𝒏𝒈)
+    # 1. Normalize (Fix fancy fonts and spaces)
     normalized_text = unicodedata.normalize('NFKC', text)
-    # Clean up standard formatting chars
     clean_text = normalized_text.replace('**', '').replace('__', '').replace('`', '').strip()
     
     # 2. Pair Detection
@@ -158,7 +155,6 @@ def parse_signal(text, timestamp=None, custom_id=None):
     raw_pair = pair_match.group(1).upper().replace('/', '')
     if raw_pair in BLACKLIST_PAIRS or len(raw_pair) < 3: return None
     
-    # Context Check (Skipped for VIP in logic below, but kept here for Public)
     is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
     has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
     if not is_major and not has_direction: return None
@@ -183,7 +179,6 @@ def parse_signal(text, timestamp=None, custom_id=None):
     # 4. Entry (Handling "Market Price" text)
     if entry_match := re.search(PATTERNS['entry'], clean_text, re.IGNORECASE):
         raw_entry = entry_match.group(1).strip().lstrip('-').strip()
-        # Convert "market price" text to simple "Market"
         if any(x in raw_entry.lower() for x in ['market', 'cmp', 'current']):
             signal['entry'] = 'Market'
         else:
@@ -191,13 +186,13 @@ def parse_signal(text, timestamp=None, custom_id=None):
     else:
         signal['entry'] = 'Market'
 
-    # 5. Targets (Handling % and / separators)
+    # 5. Targets (Handling %, /, and - separators)
     if target_match := re.search(PATTERNS['targets'], clean_text, re.IGNORECASE | re.DOTALL):
         raw_targets = target_match.group(1).replace('\n', ' ')
         if 'wait' in raw_targets.lower() or 'wating' in raw_targets.lower():
             signal['targets'] = ['Wait']
         else:
-            # Split by /, spaces, or dashes
+            # Split by /, spaces, or dashes, keeping percentages
             signal['targets'] = [t.strip() for t in re.split(r'\/|,|\s\-\s|\s+', raw_targets) if t.strip() and t.strip() not in ['-', 'TP', '%']]
     else:
         signal['targets'] = []
@@ -226,6 +221,7 @@ async def perform_backfill(client, valid_channels):
     vip_clean_ids = {get_clean_id(v) for v in CHANNELS['vip']}
     
     for channel_id in valid_channels:
+        # Use Cached Name or Fallback
         clean_id = get_clean_id(channel_id)
         channel_title = CHANNEL_NAMES_CACHE.get(clean_id, "Unknown Channel")
         
@@ -321,19 +317,29 @@ async def main():
                 logger.info("🔌 Connecting Telegram...")
                 await client.start()
                 
-                # Cache Warmup
+                # --- WARM UP CACHE (GET NAMES) ---
+                logger.info("📇 Resolving Channels...")
                 try:
                     async for dialog in client.iter_dialogs(limit=100):
-                        CHANNEL_NAMES_CACHE[get_clean_id(dialog.id)] = dialog.name
+                        clean = get_clean_id(dialog.id)
+                        CHANNEL_NAMES_CACHE[clean] = dialog.name
                 except: pass
 
+                # --- FORCE ADD IDs TO WATCHLIST ---
+                # Even if name lookup failed, we MUST listen to these IDs
                 valid_channels_set = set()
                 for chat in CHANNELS['public'] + CHANNELS['vip']:
-                    try:
-                        entity = await client.get_entity(chat)
-                        valid_channels_set.add(get_clean_id(entity.id))
-                        CHANNEL_NAMES_CACHE[get_clean_id(entity.id)] = getattr(entity, 'title', 'Unknown')
-                    except: pass
+                    clean_id = get_clean_id(chat)
+                    valid_channels_set.add(clean_id) # Force add ID
+                    
+                    # Try to fetch name if missing from cache
+                    if clean_id not in CHANNEL_NAMES_CACHE:
+                        try:
+                            entity = await client.get_entity(chat)
+                            CHANNEL_NAMES_CACHE[clean_id] = getattr(entity, 'title', 'Unknown')
+                        except: 
+                            CHANNEL_NAMES_CACHE[clean_id] = f"Channel {clean_id}"
+                            logger.warning(f"⚠️ Could not resolve name for {chat}, but listening anyway.")
 
                 async def process_event(event):
                     global MSGS_SCANNED, SIGNALS_SENT, LAST_SIGNAL_TIME
