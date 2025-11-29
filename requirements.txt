@@ -1,8 +1,9 @@
 telethon
 websockets
-pymongo
+motor
 dnspython
 certifi
 asyncio
 aiohttp
+
 
