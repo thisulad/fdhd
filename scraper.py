@@ -9,7 +9,6 @@ import os
 import certifi
 import aiohttp
 import unicodedata
-from datetime import datetime, timedelta
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from pymongo import MongoClient
@@ -44,10 +43,12 @@ except (AttributeError, IndexError, ValueError):
     BOT_ID = 0
     ADMIN_ID = 0
 
-# --- CHANNELS (Your VIP IDs) ---
+# --- CHANNELS ---
+# Ensure these IDs are correct. 
+# Private channels MUST be in the account's chat list.
 CHANNELS = {
     'public': ['Binancesignalwithishara', 'me'],
-    'vip': [-1002138095358, -1001905653511] # Ensure this ID is correct!
+    'vip': [-1002138095358, -1001905653511]
 }
 
 # --- LOGGING ---
@@ -70,26 +71,22 @@ BLACKLIST_PAIRS = {
 }
 
 PATTERNS = {
-    # PAIR: Catches "AKEUSDT", "KAS/USDT"
     'pair_strict': r'(?:⚡|🔥|\#|\$)?\s*([A-Z0-9]{2,8}(?:[/-][A-Z0-9]{2,8})?)',
-    
-    # DIRECTION: Catches "Long position", "Sell / Short"
     'direction': r'\b(Long|Short|Buy|Sell)\b',
-    
-    # ENTRY (CRITICAL FIX): Catches "Entry market price", "Above - 0.14"
     'entry': r'(?:Entry|Buy|Sell|Short|Long|EP|Enter|Price|Above|Below|At)[\s\w/\-]*(?:market\s*price|market|cmp|current|price|zone|range|target|at|above|below)?[\s:\-]*(market\s*price|market|cmp|current|[0-9\.,\s\-]+)',
-    
-    # TARGETS: Handles "35%/45%" and "TP-wait"
     'targets': r'(?:Target\s*s?|TP\s*s?|Profit|Take\s*Profit|T\.P)[\s\n:-]*(wait|wating|[0-9\.,\s\-/✅%]+)',
-    
-    # LEVERAGE: Catches "Low margin", "laverage", "10X"
     'leverage': r'(?:Lev(?:erage|erge|rage)?\s*|Margin\s*)?[:\s\-]*(?:Cross|Iso|Isolated)?\s*([0-9]+[xX]|Low\s*margin|High\s*leverage)',
-    
-    # STOP LOSS: Catches SL
     'stop_loss': r'(?:SL|Stop\s*Loss)[\s:-]*(wait|wating|[0-9\.]+)'
 }
 
 # --- HELPER FUNCTIONS ---
+
+def get_clean_id(id_value):
+    """Convert -10012345 to 12345 for consistent matching"""
+    try:
+        return abs(int(id_value))
+    except:
+        return 0
 
 def format_uptime(seconds):
     m, s = divmod(seconds, 60)
@@ -107,17 +104,11 @@ def save_signal_to_db(signal_data):
     if is_deleted(signal_data['id']): return False
     try:
         existing = signals_collection.find_one({'id': signal_data['id']})
-        # Persist source name so it doesn't revert to "Backfill"
         if existing and signal_data['source'] == 'Backfill' and existing.get('source') != 'Backfill':
             signal_data['source'] = existing['source']
-            
-        signals_collection.update_one(
-            {'id': signal_data['id']},
-            {'$set': signal_data},
-            upsert=True
-        )
+        signals_collection.update_one({'id': signal_data['id']}, {'$set': signal_data}, upsert=True)
         return existing is None
-    except PyMongoError as e:
+    except Exception as e:
         logger.error(f"⚠️ DB Save Error: {e}")
         return False
 
@@ -126,29 +117,22 @@ def get_recent_history(limit=50):
     try:
         cursor = signals_collection.find({}, {'_id': 0}).sort("timestamp", -1).limit(limit)
         return list(cursor)
-    except PyMongoError: return []
+    except: return []
 
 def delete_signal(signal_id):
     if signals_collection is None: return
     try:
         signals_collection.delete_one({'id': str(signal_id)})
-        deleted_collection.update_one(
-            {'id': str(signal_id)},
-            {'$set': {'id': str(signal_id), 'deleted_at': time.time()}},
-            upsert=True
-        )
+        deleted_collection.update_one({'id': str(signal_id)}, {'$set': {'id': str(signal_id), 'deleted_at': time.time()}}, upsert=True)
         logger.info(f"🗑️ Deleted signal {signal_id}")
-    except PyMongoError: pass
+    except: pass
 
 # --- PARSING ENGINE ---
 def parse_signal(text, timestamp=None, custom_id=None):
     if not text: return None
-    
-    # 1. Normalize (Fix fancy fonts and spaces)
     normalized_text = unicodedata.normalize('NFKC', text)
     clean_text = normalized_text.replace('**', '').replace('__', '').replace('`', '').strip()
     
-    # 2. Pair Detection
     pair_match = re.search(PATTERNS['pair_strict'], clean_text, re.IGNORECASE)
     if not pair_match: return None
     
@@ -167,73 +151,53 @@ def parse_signal(text, timestamp=None, custom_id=None):
         'timestamp': ts, 'status': 'pending'
     }
 
-    # 3. Direction
     if dir_match := re.search(PATTERNS['direction'], clean_text, re.IGNORECASE):
         d = dir_match.group(1).capitalize()
-        if d == 'Buy': signal['direction'] = 'Long'
-        elif d == 'Sell': signal['direction'] = 'Short'
-        else: signal['direction'] = d
+        signal['direction'] = 'Long' if d == 'Buy' else ('Short' if d == 'Sell' else d)
     else:
         signal['direction'] = 'Unknown'
 
-    # 4. Entry (Handling "Market Price" text)
     if entry_match := re.search(PATTERNS['entry'], clean_text, re.IGNORECASE):
         raw_entry = entry_match.group(1).strip().lstrip('-').strip()
-        if any(x in raw_entry.lower() for x in ['market', 'cmp', 'current']):
-            signal['entry'] = 'Market'
-        else:
-            signal['entry'] = raw_entry
+        signal['entry'] = 'Market' if any(x in raw_entry.lower() for x in ['market', 'cmp', 'current']) else raw_entry
     else:
         signal['entry'] = 'Market'
 
-    # 5. Targets (Handling %, /, and - separators)
     if target_match := re.search(PATTERNS['targets'], clean_text, re.IGNORECASE | re.DOTALL):
         raw_targets = target_match.group(1).replace('\n', ' ')
         if 'wait' in raw_targets.lower() or 'wating' in raw_targets.lower():
             signal['targets'] = ['Wait']
         else:
-            # Split by /, spaces, or dashes, keeping percentages
             signal['targets'] = [t.strip() for t in re.split(r'\/|,|\s\-\s|\s+', raw_targets) if t.strip() and t.strip() not in ['-', 'TP', '%']]
     else:
         signal['targets'] = []
 
-    # 6. Leverage (Handling "Low margin")
     if lev_match := re.search(PATTERNS['leverage'], clean_text, re.IGNORECASE):
         signal['leverage'] = lev_match.group(1).strip()
     else:
         signal['leverage'] = 'Standard'
         
-    # 7. Stop Loss
     if sl_match := re.search(PATTERNS['stop_loss'], clean_text, re.IGNORECASE):
         signal['stop_loss'] = sl_match.group(1).strip()
 
     return signal
 
-def get_clean_id(id_value):
-    return abs(int(id_value)) if id_value is not None else 0
-
 # --- BACKFILL ---
 async def perform_backfill(client, valid_channels):
-    while signals_collection is None:
-        await asyncio.sleep(1)
-    
+    while signals_collection is None: await asyncio.sleep(1)
     logger.info("⏳ Backfilling...")
-    vip_clean_ids = {get_clean_id(v) for v in CHANNELS['vip']}
     
     for channel_id in valid_channels:
-        # Use Cached Name or Fallback
         clean_id = get_clean_id(channel_id)
         channel_title = CHANNEL_NAMES_CACHE.get(clean_id, "Unknown Channel")
-        
         try:
             async for message in client.iter_messages(channel_id, limit=30):
                 if not message.text: continue
                 unique_id = f"tg_{channel_id}_{message.id}"
                 if is_deleted(unique_id): continue
-                
                 parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id)
                 if parsed:
-                    parsed['type'] = 'VIP' if (channel_id in vip_clean_ids) else 'Public'
+                    parsed['type'] = 'VIP' if clean_id in {get_clean_id(v) for v in CHANNELS['vip']} else 'Public'
                     parsed['source'] = channel_title
                     save_signal_to_db(parsed)
         except: pass
@@ -248,33 +212,26 @@ async def broadcast_signal(signal_data, delete_action=False):
 
 async def send_telegram_alert(signal):
     if not BOT_TOKEN or not BOT_CHAT_ID: return
-
     emoji = "🟢" if signal.get('direction') == 'Long' else "🔴"
-    
     targets_str = "   ⏳ TP: Wait" if 'Wait' in signal['targets'] else "\n".join([f"   🎯 {t}" for t in signal['targets']])
     sl_str = f"\n🛑 **SL:** {signal.get('stop_loss', 'N/A')}" if signal.get('stop_loss') else ""
-    
     msg = (f"⚡ **{signal['pair']}** {emoji} **{signal['direction'].upper()}**\n\n"
            f"📥 **Entry:** {signal['entry']}\n"
            f"⚙️ **Lev:** {signal['leverage']}"
            f"{sl_str}\n\n"
            f"**Targets:**\n{targets_str}\n\n"
            f"🔎 _Source: {signal.get('source', 'Unknown')}_")
-
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": BOT_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
-
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as response:
-                if response.status != 200: logger.error(f"Alert Failed: {await response.text()}")
+            await session.post(url, json=payload)
     except: pass
 
 async def websocket_handler(websocket):
     connected_clients.add(websocket)
     if signals_collection:
-        for old_signal in reversed(get_recent_history(50)):
-            await websocket.send(json.dumps(old_signal))
+        for old in reversed(get_recent_history(50)): await websocket.send(json.dumps(old))
     try:
         async for message in websocket:
             if not signals_collection: continue
@@ -296,128 +253,105 @@ async def websocket_handler(websocket):
 async def main():
     global mongo_client, signals_collection, deleted_collection
     
+    # 1. Start Server INSTANTLY (Fixes Render Port Timeout)
     logger.info(f"🚀 Starting Server on port {PORT}...")
-    server = await websockets.serve(websocket_handler, "0.0.0.0", PORT, ping_interval=20, ping_timeout=20)
+    server = await websockets.serve(websocket_handler, "0.0.0.0", PORT, ping_interval=30, ping_timeout=120)
 
+    # 2. Resilient Background Task
     async def bootstrap_app():
         global mongo_client, signals_collection, deleted_collection
         
-        if MONGO_URI:
+        while True: # Keep trying to connect forever
             try:
-                mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
-                db = mongo_client["crypto_scraper"]
-                signals_collection = db["signals"]
-                deleted_collection = db["deleted_signals"]
-                logger.info("✅ MongoDB Connected")
-            except: return
+                # DB Connect
+                if not mongo_client and MONGO_URI:
+                    mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
+                    db = mongo_client["crypto_scraper"]
+                    signals_collection = db["signals"]
+                    deleted_collection = db["deleted_signals"]
+                    logger.info("✅ MongoDB Connected")
 
-        if SESSION_STRING:
-            try:
-                client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-                logger.info("🔌 Connecting Telegram...")
-                await client.start()
-                
-                # --- WARM UP CACHE (GET NAMES) ---
-                logger.info("📇 Resolving Channels...")
-                try:
-                    async for dialog in client.iter_dialogs(limit=100):
-                        clean = get_clean_id(dialog.id)
-                        CHANNEL_NAMES_CACHE[clean] = dialog.name
-                except: pass
-
-                # --- FORCE ADD IDs TO WATCHLIST ---
-                # Even if name lookup failed, we MUST listen to these IDs
-                valid_channels_set = set()
-                for chat in CHANNELS['public'] + CHANNELS['vip']:
-                    clean_id = get_clean_id(chat)
-                    valid_channels_set.add(clean_id) # Force add ID
+                # Telegram Connect
+                if SESSION_STRING:
+                    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+                    logger.info("🔌 Connecting Telegram...")
+                    await client.start()
+                    logger.info("✅ Telegram Connected")
                     
-                    # Try to fetch name if missing from cache
-                    if clean_id not in CHANNEL_NAMES_CACHE:
-                        try:
-                            entity = await client.get_entity(chat)
-                            CHANNEL_NAMES_CACHE[clean_id] = getattr(entity, 'title', 'Unknown')
-                        except: 
-                            CHANNEL_NAMES_CACHE[clean_id] = f"Channel {clean_id}"
-                            logger.warning(f"⚠️ Could not resolve name for {chat}, but listening anyway.")
-
-                async def process_event(event):
-                    global MSGS_SCANNED, SIGNALS_SENT, LAST_SIGNAL_TIME
-                    if event.sender_id == BOT_ID: return 
-                    if SCRAPER_PAUSED and not event.is_private: return
-
-                    clean_id = get_clean_id(event.chat_id)
-                    if clean_id not in valid_channels_set and not event.is_private: return
+                    # --- CRITICAL: FIND CHANNELS ---
+                    # Scan ALL dialogs to find the private channels
+                    logger.info("📇 Scanning Dialogs for Channels...")
+                    valid_channels_set = set()
                     
-                    MSGS_SCANNED += 1
-                    unique_id = f"tg_{clean_id}_{event.id}"
-                    if is_deleted(unique_id): return
+                    # Convert config IDs to clean integers
+                    target_ids = {get_clean_id(c) for c in CHANNELS['public'] + CHANNELS['vip']}
                     
-                    parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
-                    if parsed:
-                        if clean_id in valid_channels_set:
-                            vip_ids = [get_clean_id(x) for x in CHANNELS['vip']]
-                            parsed['type'] = 'VIP' if (clean_id in vip_ids) else 'Public'
-                            parsed['source'] = CHANNEL_NAMES_CACHE.get(clean_id, 'Channel')
-                        else:
-                            parsed['source'] = 'Saved'; parsed['type'] = 'Manual'
+                    async for dialog in client.iter_dialogs(limit=None): # No limit, scan all
+                        clean_id = get_clean_id(dialog.id)
+                        CHANNEL_NAMES_CACHE[clean_id] = dialog.name
                         
-                        is_new = save_signal_to_db(parsed)
-                        await broadcast_signal(parsed)
-                        if is_new: 
-                            SIGNALS_SENT += 1
-                            LAST_SIGNAL_TIME = time.time()
-                            await send_telegram_alert(parsed)
+                        # If this dialog is in our target list, add it
+                        if clean_id in target_ids:
+                            valid_channels_set.add(clean_id)
+                            logger.info(f"   ✅ Found Channel: {dialog.name} ({clean_id})")
 
-                @client.on(events.NewMessage(pattern='/'))
-                async def admin_handler(event):
-                    global SCRAPER_PAUSED, MSGS_SCANNED
-                    if event.sender_id != ADMIN_ID: return
-                    cmd = event.text.split()[0].lower()
+                    # If we missed any, try adding them by raw ID (fallback)
+                    for raw_id in target_ids:
+                        if raw_id not in valid_channels_set:
+                            logger.warning(f"   ⚠️ Warning: Could not find channel {raw_id} in dialog list. Bot might not be a member.")
+                            valid_channels_set.add(raw_id) # Force add anyway
+
+                    # Handlers
+                    async def process_event(event):
+                        global MSGS_SCANNED, SIGNALS_SENT, LAST_SIGNAL_TIME
+                        if event.sender_id == BOT_ID or (SCRAPER_PAUSED and not event.is_private): return
+                        
+                        clean_id = get_clean_id(event.chat_id)
+                        if clean_id not in valid_channels_set and not event.is_private: return
+                        
+                        MSGS_SCANNED += 1
+                        unique_id = f"tg_{clean_id}_{event.id}"
+                        if is_deleted(unique_id): return
+                        
+                        parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
+                        if parsed:
+                            vip_ids = {get_clean_id(x) for x in CHANNELS['vip']}
+                            parsed['type'] = 'VIP' if clean_id in vip_ids else 'Public'
+                            parsed['source'] = CHANNEL_NAMES_CACHE.get(clean_id, 'Channel')
+                            
+                            is_new = save_signal_to_db(parsed)
+                            await broadcast_signal(parsed)
+                            if is_new:
+                                SIGNALS_SENT += 1
+                                LAST_SIGNAL_TIME = time.time()
+                                await send_telegram_alert(parsed)
+
+                    @client.on(events.NewMessage(pattern='/'))
+                    async def admin_handler(event):
+                        global SCRAPER_PAUSED, MSGS_SCANNED
+                        if event.sender_id != ADMIN_ID: return
+                        cmd = event.text.split()[0].lower()
+                        if cmd == '/status':
+                            msg = f"📊 **Bot Status**\n🟢 Running\nLast Sig: {format_uptime(time.time() - LAST_SIGNAL_TIME) if LAST_SIGNAL_TIME else 'None'} ago"
+                            await event.respond(msg)
+                        elif cmd == '/reset':
+                            try:
+                                signals_collection.delete_many({})
+                                MSGS_SCANNED = 0
+                                await event.respond("🧹 DB Cleared.")
+                                asyncio.create_task(perform_backfill(client, valid_channels_set))
+                            except: pass
+
+                    client.add_event_handler(process_event, events.NewMessage)
+                    client.add_event_handler(process_event, events.MessageEdited)
                     
-                    if cmd == '/status':
-                        uptime = format_uptime(time.time() - START_TIME)
-                        last_sig = f"{format_uptime(time.time() - LAST_SIGNAL_TIME)} ago" if LAST_SIGNAL_TIME else "None"
-                        msg = (f"📊 **Bot Status**\n\n"
-                               f"**Status:** {'🔴 PAUSED' if SCRAPER_PAUSED else '🟢 Running'}\n"
-                               f"**Uptime:** {uptime}\n"
-                               f"**Messages Scanned:** {MSGS_SCANNED}\n"
-                               f"**Signals Sent:** {SIGNALS_SENT}\n"
-                               f"**Dashboard Clients:** {len(connected_clients)}\n"
-                               f"**Database:** {'✅ Connected' if mongo_client else '❌ Error'}\n"
-                               f"**Telegram:** ✅ Connected\n"
-                               f"**Last Signal:** {last_sig}")
-                        await event.respond(msg)
-                    elif cmd == '/reset':
-                        try:
-                            signals_collection.delete_many({})
-                            MSGS_SCANNED = 0
-                            await event.respond("🧹 **Database Cleared!** Re-scanning...")
-                            asyncio.create_task(perform_backfill(client, valid_channels_set))
-                        except Exception as e: await event.respond(f"❌ Reset Failed: {e}")
-                    elif cmd == '/pause':
-                        SCRAPER_PAUSED = True
-                        await event.respond("⏸ Paused")
-                    elif cmd == '/resume':
-                        SCRAPER_PAUSED = False
-                        await event.respond("▶️ Resumed")
-
-                client.add_event_handler(process_event, events.NewMessage)
-                client.add_event_handler(process_event, events.MessageEdited)
-                
-                async def del_msg(e):
-                    if not e.chat_id: return
-                    clean = get_clean_id(e.chat_id)
-                    if clean in valid_channels_set:
-                        for mid in e.deleted_ids:
-                            uid = f"tg_{clean}_{mid}"
-                            delete_signal(uid)
-                            await broadcast_signal(uid, delete_action=True)
-
-                client.add_event_handler(del_msg, events.MessageDeleted)
-                await perform_backfill(client, valid_channels_set)
-                await client.run_until_disconnected()
-            except: pass
+                    await perform_backfill(client, valid_channels_set)
+                    await client.run_until_disconnected()
+                    
+            except Exception as e:
+                logger.error(f"❌ Critical Crash: {e}")
+                logger.info("♻️ Restarting loop in 10s...")
+                await asyncio.sleep(10)
 
     asyncio.create_task(bootstrap_app())
     await asyncio.get_running_loop().create_future()
