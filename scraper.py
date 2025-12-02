@@ -71,16 +71,15 @@ BLACKLIST_PAIRS = {
 }
 
 PATTERNS = {
-    'pair_strict': r'(?:\#|\$)?([A-Z0-9]{2,8}(?:/[A-Z0-9]{2,8})?)',
+    'pair_strict': r'(?:⚡|🔥|\#|\$)?\s*([A-Z0-9]{2,8}(?:[/-][A-Z0-9]{2,8})?)',
     'direction': r'\b(Long|Short|Buy|Sell)\b',
-    'entry': r'(?:Entry|Buy|Sell|Short|Long|EP|Enter|Price|Above|Below|At)(?:\s*(?:Long|Short|Zone|Range|Price|Target|at|Above|Below|\-)?)?[\s:-]*([0-9\.,\s\-]+)',
-    'targets': r'(?:Target\s*s?|TP\s*s?|Profit|Take\s*Profit|T\.P)[\s\n:-]*(wait|wating|[0-9\.,\s\-/✅]+)',
-    'leverage': r'(?:Lev(?:erage)?\s*|Margin\s*)?[:\s\-]*(?:Cross|Iso|Isolated)?\s*([0-9]+[xX](?:\s*or\s*[xX]?[0-9]+[xX]?)?)',
+    'entry': r'(?:Entry|Buy|Sell|Short|Long|EP|Enter|Price|Above|Below|At)[\s\w/\-]*(?:market\s*price|market|cmp|current|price|zone|range|target|at|above|below)?[\s:\-]*(market\s*price|market|cmp|current|[0-9\.,\s\-]+)',
+    'targets': r'(?:Target\s*s?|TP\s*s?|Profit|Take\s*Profit|T\.P)[\s\n:-]*(wait|wating|[0-9\.,\s\-/✅%]+)',
+    'leverage': r'(?:Lev(?:erage|erge|rage)?\s*|Margin\s*)?[:\s\-]*(?:Cross|Iso|Isolated)?\s*([0-9]+[xX]|Low\s*margin|High\s*leverage)',
     'stop_loss': r'(?:SL|Stop\s*Loss)[\s:-]*(wait|wating|[0-9\.]+)'
 }
 
 # --- HELPER FUNCTIONS ---
-
 def format_uptime(seconds):
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
@@ -104,10 +103,8 @@ async def save_signal_to_db(signal_data):
     if await is_deleted(signal_data['id']): return False
     try:
         existing = await signals_collection.find_one({'id': signal_data['id']})
-        # If updating, keep the original Source Name (don't overwrite with 'Backfill')
         if existing and signal_data.get('source') == 'Backfill' and existing.get('source') != 'Backfill':
             signal_data['source'] = existing['source']
-            
         await signals_collection.update_one({'id': signal_data['id']}, {'$set': signal_data}, upsert=True)
         return existing is None
     except Exception as e:
@@ -130,8 +127,10 @@ async def delete_signal(signal_id):
     except: pass
 
 # --- PARSING ENGINE ---
-def parse_signal(text, timestamp=None, custom_id=None):
+def parse_signal(text, timestamp=None, custom_id=None, is_vip=False):
     if not text: return None
+    
+    # NORMALIZE FANCY FONTS
     normalized_text = unicodedata.normalize('NFKC', text)
     clean_text = normalized_text.replace('**', '').replace('__', '').replace('`', '').strip()
     
@@ -141,9 +140,11 @@ def parse_signal(text, timestamp=None, custom_id=None):
     raw_pair = pair_match.group(1).upper().replace('/', '')
     if raw_pair in BLACKLIST_PAIRS or len(raw_pair) < 3: return None
     
-    is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
-    has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
-    if not is_major and not has_direction: return None
+    # VIP Trust Logic
+    if not is_vip:
+        is_major = any(x in raw_pair for x in ['USD', 'BTC', 'ETH', 'SOL', 'BNB'])
+        has_direction = re.search(PATTERNS['direction'], clean_text, re.IGNORECASE)
+        if not is_major and not has_direction: return None
 
     ts = timestamp if timestamp else time.time()
     sig_id = str(custom_id) if custom_id else str(int(ts * 1000))
@@ -160,7 +161,11 @@ def parse_signal(text, timestamp=None, custom_id=None):
         signal['direction'] = 'Unknown'
 
     if entry_match := re.search(PATTERNS['entry'], clean_text, re.IGNORECASE):
-        signal['entry'] = entry_match.group(1).strip().lstrip('-').strip()
+        raw_entry = entry_match.group(1).strip().lstrip('-').strip()
+        if any(x in raw_entry.lower() for x in ['market', 'cmp', 'current']):
+            signal['entry'] = 'Market'
+        else:
+            signal['entry'] = raw_entry
     else:
         signal['entry'] = 'Market'
 
@@ -169,7 +174,7 @@ def parse_signal(text, timestamp=None, custom_id=None):
         if 'wait' in raw_targets.lower() or 'wating' in raw_targets.lower():
             signal['targets'] = ['Wait']
         else:
-            signal['targets'] = [t.strip() for t in re.split(r'\/|,|\s\-\s|\s+', raw_targets) if t.strip() and t.strip() not in ['-', 'TP']]
+            signal['targets'] = [t.strip() for t in re.split(r'\/|,|\s\-\s|\s+', raw_targets) if t.strip() and t.strip() not in ['-', 'TP', '%']]
     else:
         signal['targets'] = []
 
@@ -191,15 +196,16 @@ async def perform_backfill(client, valid_channels, entity_map):
     
     for clean_id, entity in entity_map.items():
         channel_title = CHANNEL_NAMES_CACHE.get(clean_id, "Unknown Channel")
+        is_vip = clean_id in vip_clean_ids
         try:
             async for message in client.iter_messages(entity, limit=30):
                 if not message.text: continue
                 unique_id = f"tg_{clean_id}_{message.id}"
                 if await is_deleted(unique_id): continue
                 
-                parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id)
+                parsed = parse_signal(message.text, timestamp=message.date.timestamp(), custom_id=unique_id, is_vip=is_vip)
                 if parsed:
-                    parsed['type'] = 'VIP' if clean_id in vip_clean_ids else 'Public'
+                    parsed['type'] = 'VIP' if is_vip else 'Public'
                     parsed['source'] = channel_title
                     await save_signal_to_db(parsed)
         except: pass
@@ -216,7 +222,6 @@ async def broadcast_signal(signal_data, delete_action=False):
         for client in clients_snapshot:
             try: await client.send(msg)
             except: dead_clients.add(client)
-        
         if dead_clients:
             async with clients_lock: connected_clients.difference_update(dead_clients)
     except: pass
@@ -264,28 +269,15 @@ async def websocket_handler(websocket):
     finally:
         async with clients_lock: connected_clients.discard(websocket)
 
-# --- SMART HEALTH CHECK (THE CRITICAL FIX) ---
 async def health_check(connection, request):
-    # 1. If it's a real WebSocket client (Dashboard), let it pass!
-    if "Upgrade" in request.headers and request.headers["Upgrade"].lower() == "websocket":
-        return None  # Return None means "Proceed with WebSocket Handshake"
-    
-    # 2. If it's Render/Uptime Bot (HTTP), say "OK" and close
-    return http.HTTPStatus.OK, [], b"OK"
+    if request.path == "/health" or request.path == "/":
+        return http.HTTPStatus.OK, [], b"OK"
+    return None
 
 async def main():
     global mongo_client, signals_collection, deleted_collection
-    
     logger.info(f"🚀 Starting Server on port {PORT}...")
-    # Pass the Smart Health Check
-    server = await websockets.serve(
-        websocket_handler, 
-        "0.0.0.0", 
-        PORT, 
-        process_request=health_check, 
-        ping_interval=20, 
-        ping_timeout=20
-    )
+    server = await websockets.serve(websocket_handler, "0.0.0.0", PORT, process_request=health_check, ping_interval=20, ping_timeout=20)
 
     async def bootstrap_app():
         global mongo_client, signals_collection, deleted_collection
@@ -296,7 +288,6 @@ async def main():
                 signals_collection = db["signals"]
                 deleted_collection = db["deleted_signals"]
                 await signals_collection.create_index("id", unique=True)
-                await deleted_collection.create_index("id", unique=True)
                 logger.info("✅ MongoDB Connected")
             except: return
 
@@ -306,9 +297,10 @@ async def main():
                 logger.info("🔌 Connecting Telegram...")
                 await client.start()
                 
-                valid_channels_set = set()
                 entity_map = {}
+                valid_channels_set = set()
                 
+                # Cache Warmup
                 try:
                     async for dialog in client.iter_dialogs(limit=100):
                         clean_id = get_clean_id(dialog.id)
@@ -338,10 +330,12 @@ async def main():
                     unique_id = f"tg_{clean_id}_{event.id}"
                     if await is_deleted(unique_id): return
                     
-                    parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id)
+                    is_vip = clean_id in vip_clean_ids
+                    parsed = parse_signal(event.text, timestamp=event.date.timestamp(), custom_id=unique_id, is_vip=is_vip)
+                    
                     if parsed:
                         if clean_id in valid_channels_set:
-                            parsed['type'] = 'VIP' if clean_id in vip_clean_ids else 'Public'
+                            parsed['type'] = 'VIP' if is_vip else 'Public'
                             parsed['source'] = CHANNEL_NAMES_CACHE.get(clean_id, 'Channel')
                         else:
                             parsed['source'] = 'Saved'; parsed['type'] = 'Manual'
